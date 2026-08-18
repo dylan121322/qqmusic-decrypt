@@ -73,6 +73,25 @@ python3 qqmusic_decrypt.py --playlist 9028251943 --playlist 8423995962
 python3 qqmusic_decrypt.py --favorites --quality flac
 ```
 
+### macOS 打包版被 Gatekeeper 拦截的解决方法
+
+下载的 `qqmusic-decrypt-mac` 未签名，macOS 可能提示“已损坏/无法验证开发者/无法打开”。
+任选其一：
+
+```bash
+# 方法 1（推荐）：解除隔离属性后运行
+xattr -d com.apple.quarantine ~/Downloads/qqmusic-decrypt-mac
+# 若整个解压目录都需要：
+xattr -dr com.apple.quarantine ~/Downloads/qqmusic-decrypt-macos-arm64
+chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
+~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
+
+# 方法 2：Finder 右键 → 打开 → 确认“打开”（只需一次）
+# 方法 3：系统设置 → 隐私与安全性 → 底部“仍要打开”
+```
+
+> 以上仅解除下载隔离标记；若担心来源，可先核对 `release/SHA256SUMS.txt` 的校验和。
+
 ## 常用参数
 
 | 参数 | 说明 |
@@ -136,6 +155,10 @@ python3 qqmusic_decrypt.py --favorites --quality flac
 | `release/qqmusic-decrypt-win64.zip` | Windows x64 单文件 exe + 文档 | 180MB |
 
 （校验和见 `release/SHA256SUMS.txt`）
+
+> ⚠️ **macOS 首次运行**：二进制未签名，会被 Gatekeeper 拦截。解压后先执行
+> `xattr -dr com.apple.quarantine <解压目录>`，再 `chmod +x qqmusic-decrypt-mac`
+> （或 Finder 右键 → 打开）。详见上文“macOS 打包版被 Gatekeeper 拦截的解决方法”。
 
 - 单文件可执行：PyInstaller onefile，Python 运行时 + ffmpeg/ffprobe 全部内置；
   运行时优先使用内置二进制（`sys._MEIPASS`），仅当缺失才回退系统 PATH；
