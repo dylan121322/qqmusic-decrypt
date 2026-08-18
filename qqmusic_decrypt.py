@@ -136,7 +136,7 @@ QUALITY_PLAIN = {
     "mp3-128": ("M500", "mp3"),
     "mp3-320": ("M800", "mp3"),
 }
-DEFAULT_QUALITY = "flac,320,m4a"
+DEFAULT_QUALITY = "flac,320,192,128,m4a"
 
 if IS_WINDOWS:
     DEFAULT_DB = ""
@@ -889,12 +889,22 @@ def _http_post_json(url: str, body: dict) -> dict:
         raise ApiError(f"API 响应不是 JSON: {raw[:200]!r}") from e
 
 
-def fetch_url_bytes(url: str, referer: str = "https://y.qq.com/") -> bytes:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": API_USER_AGENT, "Referer": referer},
-    )
-    with _urlopen(req, timeout=120) as resp:
-        return resp.read()
+def fetch_url_bytes(url: str, referer: str = "https://y.qq.com/",
+                    retries: int = 3) -> bytes:
+    """下载 URL 内容；对 IncompleteRead/连接中断做重试（每次退避 1.5s）。"""
+    last: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": API_USER_AGENT, "Referer": referer},
+            )
+            with _urlopen(req, timeout=120) as resp:
+                return resp.read()
+        except Exception as e:  # noqa: BLE001  (URLError / IncompleteRead / 超时等)
+            last = e
+            if attempt + 1 < retries:
+                time.sleep(1.5)
+    raise ApiError(f"下载失败（重试 {retries} 次）: {last}")
 
 
 def _api_comm(creds: Credentials) -> dict:
@@ -942,9 +952,7 @@ def call_get_evkey(creds: Credentials, filename: str, songmid: str) -> dict:
     if result != 0:
         raise ApiError(f"GetEVkey result={result} subcode={info.get('subcode')} "
                        f"(文件名={filename})")
-    ekey = info.get("ekey") or ""
-    if not ekey:
-        raise ApiError("API 未返回 ekey")
+    # ekey 可能为空（该资源是普通文件或条目失效），交由下载分支按普通文件尝试
     info["sip"] = data.get("sip") or []
     return info
 
@@ -1001,12 +1009,12 @@ def resolve_download_urls(info: dict) -> List[str]:
 
 
 def fetch_audio_from_urls(info: dict) -> bytes:
-    """逐个候选 URL 下载，取第一个非空且像音频的内容。"""
+    """逐个候选 URL 下载，取第一个非空且像音频的内容（单 URL 内部已重试）。"""
     last_err: Optional[Exception] = None
     for url in resolve_download_urls(info):
         try:
             data = fetch_url_bytes(url)
-        except urllib.error.URLError as e:
+        except (ApiError, urllib.error.URLError) as e:
             last_err = e
             continue
         if len(data) < 4096:
@@ -1184,14 +1192,22 @@ def download_song_bytes(ctx: BatchContext, song: dict, qualities: Sequence[str])
                 prefix, ext = QUALITY_ENCRYPTED[q]
                 filename = f"{prefix}{mid}.{ext}"
                 info = ctx.get_evkey_info(filename, mid)
-                raw = fetch_audio_from_urls(info)
-                raw = strip_musicex_footer(raw)
-                key = parse_ekey(info["ekey"])
-                out = qmc2_decrypt(raw, key)
-                sniff = sniff_audio_ext(out)
-                if sniff:
-                    return bytes(out), sniff[1:], q
-                errors.append(f"{q}: 解密后签名校验失败")
+                if info.get("ekey"):
+                    raw = fetch_audio_from_urls(info)
+                    raw = strip_musicex_footer(raw)
+                    key = parse_ekey(info["ekey"])
+                    out = qmc2_decrypt(raw, key)
+                    sniff = sniff_audio_ext(out)
+                    if sniff:
+                        return bytes(out), sniff[1:], q
+                    errors.append(f"{q}: 解密后签名校验失败")
+                else:
+                    # 服务端返回了 purl 但没有 ekey → 当作普通文件直接下载
+                    raw = fetch_audio_from_urls(info)
+                    sniff = sniff_audio_ext(raw)
+                    if sniff:
+                        return raw, sniff[1:], q
+                    errors.append(f"{q}: 无 ekey 且下载内容签名校验失败")
             elif q in QUALITY_PLAIN:
                 prefix, ext = QUALITY_PLAIN[q]
                 filename = f"{prefix}{mid}.{ext}"
@@ -1207,7 +1223,11 @@ def download_song_bytes(ctx: BatchContext, song: dict, qualities: Sequence[str])
             errors.append(f"{q}: {e}")
         except urllib.error.URLError as e:
             errors.append(f"{q}: 下载网络错误 {e}")
-    raise QmcError("所有音质均失败 -> " + "; ".join(errors))
+    hint = ""
+    joined = "; ".join(errors)
+    if re.search(r"104003|104011", joined):
+        hint = "｜提示：104003/104011 表示账号无该歌曲可用资源（未购买付费单曲、版权限制或已下架），不是工具问题"
+    raise QmcError("所有音质均失败 -> " + joined + hint)
 
 
 def apply_tags(path: str, title: str, artist: str, album: str) -> bool:

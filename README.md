@@ -69,7 +69,7 @@ python3 qqmusic_decrypt.py --favorites
 python3 qqmusic_decrypt.py --playlist 9028251943 --limit 1
 python3 qqmusic_decrypt.py --playlist 9028251943 --playlist 8423995962
 
-# 9. 只下载指定音质（默认 flac,320,m4a；可选 flac/320/192/128/m4a/mp3-128/mp3-320）
+# 9. 只下载指定音质（默认 flac,320,192,128,m4a；可选 flac/320/192/128/m4a/mp3-128/mp3-320）
 python3 qqmusic_decrypt.py --favorites --quality flac
 ```
 
@@ -102,7 +102,7 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 | `--list-playlists` | 列出创建歌单 + 收藏歌单（含 tid / 歌名数） |
 | `--playlist TID` | 下载指定歌单（可重复） |
 | `--favorites` | 下载「我喜欢」 |
-| `--quality LIST` | 下载音质优先级，默认 `flac,320,m4a` |
+| `--quality LIST` | 下载音质优先级，默认 `flac,320,192,128,m4a` |
 | `--limit N` | 本地模式最多处理 N 个文件；歌单模式每歌单最多 N 首 |
 | `--out-dir DIR` | 输出目录（默认 `~/Music/QQMusicDecrypted`；歌单按「歌单名/」分子目录） |
 | `--in-place` | 本地模式输出到源文件同目录 |
@@ -175,7 +175,12 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 
 ## 已知限制
 
-- musicex / 加密下载依赖账号权限：`result=104003/104005` 表示该音质不可用，工具会自动降级下一音质（含普通 m4a 兜底）；
+- musicex / 加密下载依赖账号权限：`result=104003/104005` 表示该音质不可用，工具会自动降级下一音质
+  （默认顺序 flac→320→192→128→m4a）；
+- **所有音质都返回 104003/104011 时**：服务器判定该账号没有可用资源——常见原因是
+  未购买付费单曲（`price_track>0` 且未购买）、版权方限制（仅试听）或歌曲已下架，
+  这不是工具 bug；购买后重试即可（部分翻唱/UGC 曲目购买也不可下载）；
+- 下载对网络中断（IncompleteRead）自动重试 3 次，并回退多个 CDN 域名；
 - 单个 `.mgg` 缓存可能需要最多 4 次 API 探测（O8M0→O4M0→O6M0→M8M0）；
 - 歌单下载速度受 API 间隔与 CDN 带宽影响；`--quality flac` 单音质可减少 API 次数；
 - 单线程；本地 24MB `.mflac` 约 6s，歌单每首含下载+解密+ffmpeg 标签；
