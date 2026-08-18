@@ -1,0 +1,8 @@
+__pycache__/
+build/
+dist/
+*.pyc
+qqmusic-decrypt-mac.spec
+release/*.zip
+release/qqmusic-decrypt-macos-arm64/
+release/qqmusic-decrypt-win64/
