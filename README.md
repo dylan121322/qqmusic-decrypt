@@ -112,6 +112,7 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 | `--no-api` | 禁用 API（只解内嵌 ekey / 静态格式） |
 | `--tag` / `--no-tag` | 是否用 ffmpeg 写标题/歌手/专辑（默认开，失败不致命） |
 | `--no-ffprobe` | 不做 ffprobe 时长验证 |
+| `--log-file FILE` | 报错日志文件（默认 `<输出目录>/qqmusic_decrypt.log`） |
 | `--delay S` | API 调用间隔（默认 0.15s） |
 | `--db / --prefs` | 覆盖 sqlite / plist 路径 |
 | `--uin U --authst A` | 手动凭据（跳过自动凭据） |
@@ -172,6 +173,12 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 
 [GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0-or-later）。
 使用、修改、分发本项目须遵守 AGPL-3.0；同时受 [DISCLAIMER.md](DISCLAIMER.md) 约束。
+
+## 报错日志
+
+- 所有 FAIL（歌曲/文件级）、authst 失效停批、未捕获异常（含完整 traceback）都会写入日志文件；
+- 默认路径 `<输出目录>/qqmusic_decrypt.log`，可用 `--log-file` 指定；
+- 交互菜单 [6] 设置页可查看/修改日志路径；日志写入失败不影响主流程。
 
 ## 已知限制
 

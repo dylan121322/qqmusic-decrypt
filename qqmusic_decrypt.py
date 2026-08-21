@@ -25,6 +25,7 @@ import argparse
 import base64
 import glob
 import json
+import logging
 import math
 import os
 import plistlib
@@ -35,6 +36,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -206,6 +208,67 @@ class TeaError(QmcError):
 
 class ApiError(QmcError):
     pass
+
+
+# ----------------------------------------------------------------------------
+# 文件日志（报错日志记录，控制台输出行为不变）
+# ----------------------------------------------------------------------------
+
+LOG = logging.getLogger("qqmusic_decrypt")
+LOG_FILE: Optional[str] = None
+
+
+def init_logging(path: Optional[str]) -> str:
+    """初始化/切换文件日志路径，返回实际路径。日志不可用不阻塞主流程。"""
+    global LOG_FILE
+    new_path = os.path.abspath(os.path.expanduser(
+        path or os.path.join(DEFAULT_OUT_DIR, "qqmusic_decrypt.log")))
+    try:
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+    except OSError:
+        pass
+    current = getattr(LOG.handlers[0], "baseFilename", None) if LOG.handlers else None
+    if current != new_path:
+        try:
+            for h in LOG.handlers[:]:
+                LOG.removeHandler(h)
+                try:
+                    h.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            handler = logging.FileHandler(new_path, encoding="utf-8")
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(message)s"))
+            LOG.addHandler(handler)
+            LOG.setLevel(logging.INFO)
+        except OSError:
+            pass
+    LOG_FILE = new_path
+    return LOG_FILE
+
+
+def log_error(message: str, exc_info: bool = False) -> None:
+    try:
+        if exc_info:
+            LOG.error(message, exc_info=True)
+        else:
+            LOG.error(message)
+    except Exception:  # noqa: BLE001  日志失败不影响主流程
+        pass
+
+
+def log_info(message: str) -> None:
+    try:
+        LOG.info(message)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def log_warning(message: str) -> None:
+    try:
+        LOG.warning(message)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -1331,6 +1394,7 @@ class BatchContext:
                 if re.search(r"500001|authst", str(e)):
                     self.stop = True
                     self.stop_reason = str(e)
+                    log_warning(f"authst 失效，停止后续任务: {e}")
                 raise
             self.api_calls += 1
             self._api_wait()
@@ -1492,9 +1556,11 @@ def process_file(path: str, ctx: BatchContext, idx: int, total: int) -> Result:
 
     except QmcError as e:
         print(f"[{idx}/{total}] FAIL {path}  {e}", file=sys.stderr)
+        log_error(f"[{idx}/{total}] FAIL {path}  {e}")
         return Result(path, "fail", str(e))
     except Exception as e:  # noqa: BLE001
         print(f"[{idx}/{total}] FAIL {path}  未预期错误: {e!r}", file=sys.stderr)
+        log_error(f"[{idx}/{total}] FAIL {path}  未预期错误: {e!r}", exc_info=True)
         return Result(path, "fail", repr(e))
 
 
@@ -1674,6 +1740,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="不写音频标签")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="进入交互式菜单")
+    p.add_argument("--log-file", default=None,
+                   help="报错日志文件（默认 <输出目录>/qqmusic_decrypt.log）")
     p.add_argument("--debug-tools", action="store_true",
                    help="打印内置 ffmpeg/ffprobe 定位与版本后退出")
     p.add_argument("--self-test", action="store_true", help="运行内置自测后退出")
@@ -1748,6 +1816,8 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
                                   str(out_path), dur))
         except Exception as e:  # noqa: BLE001
             print(f"[{i}/{len(songs)}] FAIL {artists} - {name}  {e}", file=sys.stderr)
+            log_error(f"[{i}/{len(songs)}] FAIL {artists} - {name} ({song.get('mid')})  {e}",
+                      exc_info=not isinstance(e, (QmcError, ApiError)))
             fail += 1
             results.append(Result(f"{artists} - {name}", "fail", str(e)))
         if ctx.stop:
@@ -1792,6 +1862,7 @@ MENU_SETTINGS = """
   [4] 覆盖已有文件    当前: {overwrite}
   [5] 写入音频标签    当前: {tag}
   [6] API 调用间隔    当前: {delay}s
+  [7] 报错日志文件    当前: {log_file}
   [0] 返回"""
 
 
@@ -2003,6 +2074,7 @@ class InteractiveCli:
                 overwrite="是" if self.opts.overwrite else "否",
                 tag="是" if self.opts.tag else "否",
                 delay=self.opts.delay,
+                log_file=LOG_FILE or "(不可用)",
             ))
             ans = self.ask("选择: ")
             if ans in (None, "0"):
@@ -2039,6 +2111,12 @@ class InteractiveCli:
                     self.opts.delay = max(0.0, float(cur or 0))
                 except ValueError:
                     print("[错误] 需要数字")
+            elif ans == "7":
+                cur = self.ask(f"报错日志文件 [{LOG_FILE or ''}]: ")
+                if cur:
+                    self.opts.log_file = os.path.expanduser(cur)
+                    log_info(f"日志路径变更为 {init_logging(self.opts.log_file)}")
+                    print(f"  日志文件: {LOG_FILE}")
 
     @staticmethod
     def show_help():
@@ -2113,6 +2191,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global API_PLATFORM
     if opts.platform != "auto":
         API_PLATFORM = opts.platform
+    log_path = init_logging(opts.log_file)
+    log_info(f"=== 会话开始 pid={os.getpid()} platform={API_PLATFORM} "
+             f"is_windows={IS_WINDOWS} log={log_path}")
     if opts.self_test:
         run_self_test()
         return 0
@@ -2201,12 +2282,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     skip = [r for r in results if r.status == "skip"]
     print(f"\n完成: 成功 {len(ok)}, 跳过 {len(skip)}, 失败 {len(fail)}, "
           f"API 调用 {ctx.api_calls} 次")
+    log_info(f"完成: 成功 {len(ok)}, 跳过 {len(skip)}, 失败 {len(fail)}, "
+             f"API 调用 {ctx.api_calls} 次")
     if fail:
         for r in fail:
             print(f"  FAIL {r.path}: {r.message}", file=sys.stderr)
+            log_error(f"FAIL {r.path}: {r.message}")
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        log_error("未捕获异常", exc_info=True)
+        print(f"未捕获异常，已写入日志: {LOG_FILE or '(日志不可用)'}", file=sys.stderr)
+        raise
