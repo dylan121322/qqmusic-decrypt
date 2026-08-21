@@ -980,12 +980,12 @@ def call_get_vkey(creds: Credentials, filename: str, songmid: str) -> dict:
     return info
 
 
-# 普通资源在 Win 端 sip 可能为空，按实测可用性顺序回退 HTTPS CDN
+# 普通资源在 Win 端 sip 可能为空，按实测速度排序回退 HTTPS CDN
 PLAIN_CDN_HOSTS = (
-    "https://dl.stream.qqmusic.qq.com/",
     "https://ws.stream.qqmusic.qq.com/",
     "https://isure.stream.qqmusic.qq.com/",
     "https://aqqmusic.tc.qq.com/",
+    "https://dl.stream.qqmusic.qq.com/",  # 实测在 Win 上很慢（~200KB/s），放最后
 )
 
 
@@ -1157,9 +1157,16 @@ def get_playlist_detail(creds: Credentials, tid: int, max_songs: int = 0,
                 return title, songs[:max_songs]
         if max_songs and len(songs) >= max_songs:
             return title, songs[:max_songs]
-        if not batch or not data.get("hasmore"):
+        if not batch:
             return title, songs
         begin += len(batch)
+        total = data.get("total_song_num")
+        if isinstance(total, int) and total > 0:
+            # Win 接口没有 hasmore 字段，用 total_song_num 判断是否翻页
+            if begin >= total:
+                return title, songs
+        elif not data.get("hasmore"):
+            return title, songs
         param["song_begin"] = begin
 
 
