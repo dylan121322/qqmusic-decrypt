@@ -1922,7 +1922,8 @@ MENU_MAIN = """
   [5] 本地文件预演 / 格式查看
   [6] 设置（音质 / 输出目录 / 上限 / 标签…）
   [7] 运行自测
-  [8] 帮助
+  [8] 下载输出格式    当前: {out_format}
+  [9] 帮助
   [0] 退出"""
 
 MENU_SETTINGS = """
@@ -2224,10 +2225,24 @@ class InteractiveCli:
 仅限本人账号资源、个人备份用途。""")
 
 
+    def do_format_quick(self):
+        """主菜单直达：选择下载输出格式。"""
+        print("  可选格式: " + ", ".join(
+            f"{k}({v})" for k, v in OUTPUT_FORMATS.items()))
+        cur = self.ask(f"下载输出格式 [{self.opts.out_format}]: ",
+                       self.opts.out_format)
+        if cur and cur.strip().lower() in OUTPUT_FORMATS:
+            self.opts.out_format = cur.strip().lower()
+            print(f"  输出格式: {OUTPUT_FORMATS[self.opts.out_format]}")
+        else:
+            print("[错误] 格式无效")
+
     def run(self):
         print(MENU_BANNER)
         while True:
-            print(MENU_MAIN)
+            print(MENU_MAIN.format(
+                out_format=OUTPUT_FORMATS.get(
+                    getattr(self.opts, "out_format", "auto"), "auto")))
             ans = self.ask("\n选择操作: ")
             if ans is None or ans == "0":
                 print("再见。")
@@ -2252,9 +2267,11 @@ class InteractiveCli:
                 elif ans == "7":
                     run_self_test()
                 elif ans == "8":
+                    self.do_format_quick()
+                elif ans == "9":
                     self.show_help()
                 else:
-                    print("[错误] 无效选择，输入 0-8")
+                    print("[错误] 无效选择，输入 0-9")
             except QmcError as e:
                 print(f"[错误] {e}")
             self.pause()
