@@ -140,6 +140,25 @@ QUALITY_PLAIN = {
 }
 DEFAULT_QUALITY = "flac,320,192,128,m4a"
 
+# 下载输出格式（auto=保持源格式；其余用内置 ffmpeg 转换）
+OUTPUT_FORMATS = {
+    "auto": "保持源格式",
+    "flac": "FLAC 无损",
+    "mp3": "MP3 320kbps",
+    "m4a": "AAC 256kbps",
+    "ogg": "Vorbis q5",
+    "opus": "Opus 192kbps",
+    "wav": "WAV PCM 16bit",
+}
+CONVERT_ARGS = {
+    "mp3": ["-codec:a", "libmp3lame", "-b:a", "320k"],
+    "flac": ["-codec:a", "flac"],
+    "m4a": ["-codec:a", "aac", "-b:a", "256k"],
+    "ogg": ["-codec:a", "libvorbis", "-q:a", "5"],
+    "opus": ["-codec:a", "libopus", "-b:a", "192k"],
+    "wav": ["-codec:a", "pcm_s16le"],
+}
+
 if IS_WINDOWS:
     DEFAULT_DB = ""
     DEFAULT_PREFS = ""
@@ -1323,6 +1342,30 @@ def apply_tags(path: str, title: str, artist: str, album: str) -> bool:
             os.remove(tmp)
     return False
 
+
+def convert_audio(src_path: str, dst_ext: str) -> str:
+    """用内置 ffmpeg 把 src_path 转成 dst_ext，返回转换后的临时文件路径。"""
+    if dst_ext not in CONVERT_ARGS:
+        raise QmcError(f"不支持的输出格式: {dst_ext}")
+    ffmpeg = tool_path("ffmpeg")
+    if not ffmpeg:
+        raise QmcError("未找到 ffmpeg，无法转换格式")
+    tmp = f"{src_path}.conv.{dst_ext}"  # 保留扩展名供 ffmpeg 推断容器
+    cmd = [ffmpeg, "-v", "error", "-y", "-i", src_path,
+           *CONVERT_ARGS[dst_ext], tmp]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=600)
+    except Exception as e:  # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise QmcError(f"ffmpeg 转换异常: {e}") from e
+    if r.returncode != 0 or not os.path.exists(tmp):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise QmcError(f"ffmpeg 转换失败: {(r.stderr or b'').decode('utf-8', 'replace')[-300:]}")
+    return tmp
+
+
 def sanitize_name(name: str, max_len: int = 120) -> str:
     name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name).strip(" .")
     name = re.sub(r"\s+", " ", name)
@@ -1734,6 +1777,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="下载「我喜欢」列表（dirId=201）")
     p.add_argument("--quality", default=DEFAULT_QUALITY,
                    help="下载音质优先级，逗号分隔：flac,320,192,128,m4a,mp3-128,mp3-320")
+    p.add_argument("--format", dest="out_format", default="auto",
+                   choices=sorted(OUTPUT_FORMATS),
+                   help="下载输出格式（auto=保持源格式，其余用内置 ffmpeg 转换）")
     p.add_argument("--tag", dest="tag", action="store_true", default=True,
                    help="用 ffmpeg 写入标题/歌手/专辑标签（默认开，失败不报错）")
     p.add_argument("--no-tag", dest="tag", action="store_false",
@@ -1796,18 +1842,42 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
         try:
             audio, ext, quality = download_song_bytes(ctx, song, qualities)
             fname = sanitize_name(f"{artists} - {name}") if artists else sanitize_name(name)
-            out_path = folder / f"{fname}.{ext}"
+            want_ext = str(getattr(opts, "out_format", "auto") or "auto")
+            final_ext = ext if want_ext == "auto" else want_ext
+            out_path = folder / f"{fname}.{final_ext}"
             if out_path.exists() and not opts.overwrite:
-                print(f"[{i}/{len(songs)}] SKIP {fname}.{ext}  (已存在)")
+                print(f"[{i}/{len(songs)}] SKIP {fname}.{final_ext}  (已存在)")
                 skip += 1
                 results.append(Result(f"{artists} - {name}", "skip",
                                       f"输出已存在: {out_path}"))
                 continue
-            out_path.write_bytes(audio)
+            note = ""
+            if final_ext == ext:
+                out_path.write_bytes(audio)
+            else:
+                # 下载源文件 → ffmpeg 转换 → 替换为最终格式；失败保留源格式
+                src_tmp = str(out_path) + f".src{ext}"
+                Path(src_tmp).write_bytes(audio)
+                try:
+                    conv_tmp = convert_audio(src_tmp, final_ext)
+                    os.replace(conv_tmp, out_path)
+                    os.remove(src_tmp)
+                    note = f" 转{final_ext.upper()}"
+                except QmcError as ce:
+                    log_warning(f"[{i}/{len(songs)}] {artists} - {name} 转换失败，"
+                                f"保留源格式: {ce}")
+                    fallback = folder / f"{fname}.{ext}"
+                    n = 1
+                    while fallback.exists() and not opts.overwrite:
+                        fallback = folder / f"{fname} ({n}).{ext}"
+                        n += 1
+                    os.replace(src_tmp, fallback)
+                    out_path = fallback
+                    note = " 转换失败保留源格式"
             if opts.tag:
                 apply_tags(str(out_path), name, artists, album)
             dur = ffprobe_duration(str(out_path)) if not opts.no_ffprobe else None
-            msg = f"{ext.upper()} {quality} {len(audio)}B"
+            msg = f"{Path(out_path).suffix[1:].upper()} {quality} {os.path.getsize(out_path)}B{note}"
             if dur is not None:
                 msg += f" {dur:.1f}s"
             print(f"[{i}/{len(songs)}] OK  {out_path}  ({msg})")
@@ -1863,6 +1933,7 @@ MENU_SETTINGS = """
   [5] 写入音频标签    当前: {tag}
   [6] API 调用间隔    当前: {delay}s
   [7] 报错日志文件    当前: {log_file}
+  [8] 下载输出格式    当前: {out_format}
   [0] 返回"""
 
 
@@ -2075,6 +2146,8 @@ class InteractiveCli:
                 tag="是" if self.opts.tag else "否",
                 delay=self.opts.delay,
                 log_file=LOG_FILE or "(不可用)",
+                out_format=OUTPUT_FORMATS.get(getattr(self.opts, "out_format", "auto"),
+                                               self.opts.out_format),
             ))
             ans = self.ask("选择: ")
             if ans in (None, "0"):
@@ -2117,6 +2190,16 @@ class InteractiveCli:
                     self.opts.log_file = os.path.expanduser(cur)
                     log_info(f"日志路径变更为 {init_logging(self.opts.log_file)}")
                     print(f"  日志文件: {LOG_FILE}")
+            elif ans == "8":
+                print("  可选格式: " + ", ".join(
+                    f"{k}({v})" for k, v in OUTPUT_FORMATS.items()))
+                cur = self.ask(f"下载输出格式 [{self.opts.out_format}]: ",
+                               self.opts.out_format)
+                if cur.strip().lower() in OUTPUT_FORMATS:
+                    self.opts.out_format = cur.strip().lower()
+                    print(f"  输出格式: {OUTPUT_FORMATS[self.opts.out_format]}")
+                else:
+                    print("[错误] 格式无效")
 
     @staticmethod
     def show_help():

@@ -71,6 +71,9 @@ python3 qqmusic_decrypt.py --playlist 9028251943 --playlist 8423995962
 
 # 9. 只下载指定音质（默认 flac,320,192,128,m4a；可选 flac/320/192/128/m4a/mp3-128/mp3-320）
 python3 qqmusic_decrypt.py --favorites --quality flac
+
+# 10. 下载后自动转格式（默认 auto=保持源格式；可选 auto/flac/mp3/m4a/ogg/opus/wav）
+python3 qqmusic_decrypt.py --favorites --format mp3
 ```
 
 ### macOS 打包版被 Gatekeeper 拦截的解决方法
@@ -103,6 +106,7 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 | `--playlist TID` | 下载指定歌单（可重复） |
 | `--favorites` | 下载「我喜欢」 |
 | `--quality LIST` | 下载音质优先级，默认 `flac,320,192,128,m4a` |
+| `--format FMT` | 下载输出格式：`auto/flac/mp3/m4a/ogg/opus/wav`（下载后用内置 ffmpeg 转换） |
 | `--limit N` | 本地模式最多处理 N 个文件；歌单模式每歌单最多 N 首 |
 | `--out-dir DIR` | 输出目录（默认 `~/Music/QQMusicDecrypted`；歌单按「歌单名/」分子目录） |
 | `--in-place` | 本地模式输出到源文件同目录 |
