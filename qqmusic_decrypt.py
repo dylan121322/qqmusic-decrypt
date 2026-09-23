@@ -2445,37 +2445,68 @@ class InteractiveCli:
         else:
             print("[错误] 格式无效")
 
+    def _ask_change_out_dir(self) -> bool:
+        """交互式修改输出目录（带可写性校验）。返回是否成功修改。"""
+        cur = self.ask(f"新的输出目录（回车保持 [{self.opts.out_dir}]）: ")
+        if not cur or not cur.strip():
+            return False
+        new_dir = normalize_user_path(cur)
+        try:
+            probe_writable_dir(new_dir)
+        except OSError as e:
+            print(f"[错误] 目录不可写，未修改: {new_dir}\n  原因: {e}")
+            return False
+        self.opts.out_dir = new_dir
+        print(f"  输出目录已改为: {new_dir}")
+        return True
+
     def do_convert_interactive(self):
         """交互式：用内置 ffmpeg 转换本地普通音频文件。"""
         if self.opts.out_format == "auto":
             print("当前输出格式为 auto，请先用主菜单 [8] 或设置 [8] 选择目标格式")
             return
-        print(f"目标格式: {OUTPUT_FORMATS[self.opts.out_format]}")
-        print("  [1] ~/Downloads")
-        print("  [2] 自定义文件 / 目录")
-        print("  [0] 返回")
-        ans = self.ask("选择来源: ")
-        if ans in (None, "0"):
-            return
-        if ans == "1":
-            paths: List[str] = [os.path.expanduser("~/Downloads")]
-            rec = self.opts.recursive
-        elif ans == "2":
-            raw = self.ask("输入文件或目录路径（支持引号/转义/~/file://）: ")
-            p = normalize_user_path(raw or "")
-            if not p or not os.path.exists(p):
-                print("[错误] 路径不存在")
+        while True:
+            print(f"目标格式: {OUTPUT_FORMATS[self.opts.out_format]}")
+            print(f"输出目录: {self.opts.out_dir}")
+            print("  [1] ~/Downloads")
+            print("  [2] 自定义文件 / 目录")
+            print("  [3] 修改输出目录")
+            print("  [0] 返回")
+            ans = self.ask("选择来源: ")
+            if ans in (None, "0"):
                 return
-            paths = [p]
-            rec = self.confirm("递归扫描子目录？") if os.path.isdir(p) else False
-        else:
-            print("[错误] 选择无效")
-            return
+            if ans == "3":
+                self._ask_change_out_dir()
+                continue
+            if ans == "1":
+                paths: List[str] = [os.path.expanduser("~/Downloads")]
+                rec = self.opts.recursive
+            elif ans == "2":
+                raw = self.ask("输入文件或目录路径（支持引号/转义/~/file://）: ")
+                p = normalize_user_path(raw or "")
+                if not p or not os.path.exists(p):
+                    print("[错误] 路径不存在")
+                    return
+                paths = [p]
+                rec = self.confirm("递归扫描子目录？") if os.path.isdir(p) else False
+            else:
+                print("[错误] 选择无效")
+                continue
+            break
         files = discover_audio(paths, rec)
         if not files:
             print("没有找到可转换的音频文件。")
             return
-        print(f"发现 {len(files)} 个音频文件，输出目录: {self.opts.out_dir}")
+        print(f"发现 {len(files)} 个音频文件，当前输出目录: {self.opts.out_dir}")
+        cur = self.ask(f"直接回车开始转换，或输入新的输出目录 [{self.opts.out_dir}]: ")
+        if cur and cur.strip():
+            new_dir = normalize_user_path(cur)
+            try:
+                probe_writable_dir(new_dir)
+                self.opts.out_dir = new_dir
+                print(f"  输出目录已改为: {new_dir}")
+            except OSError as e:
+                print(f"[错误] 目录不可写，继续使用原目录: {e}")
         if len(files) > 5 and not self.confirm("确认开始转换？"):
             print("已取消。")
             return
