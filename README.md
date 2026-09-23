@@ -186,6 +186,21 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 - 默认路径 `<输出目录>/qqmusic_decrypt.log`，可用 `--log-file` 指定；
 - 交互菜单 [6] 设置页可查看/修改日志路径；日志写入失败不影响主流程。
 
+
+### macOS 写入外部卷报 Permission denied（TCC 拦截）
+
+现象：输出目录选在 `/Volumes/...` 外部磁盘时，工具提示“输出目录被 macOS 隐私权限拦截”，
+即使终端手动 `touch` 该卷是成功的。
+
+原因：macOS 隐私保护（TCC）按“责任进程”授权；Finder/第三方启动器直启的二进制可能被拒绝
+访问可移动卷宗，而终端通常已有权限。
+
+解决（任选）：
+1. 双击包内 **`Start-Mac.command`** 启动（经 Terminal 运行，可正常访问外部卷）；
+2. 系统设置 → 隐私与安全性 → 完全磁盘访问 → 添加 `qqmusic-decrypt-mac`（或 Terminal）后重启程序；
+3. 终端执行 `tccutil reset SystemPolicyRemovableVolumes` 后重新运行，弹窗点“允许”；
+4. 或把输出目录换到内置盘：`--out-dir ~/Music/QQMusicDecrypted`。
+
 ## 已知限制
 
 - musicex / 加密下载依赖账号权限：`result=104003/104005` 表示该音质不可用，工具会自动降级下一音质

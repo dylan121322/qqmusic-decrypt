@@ -1864,13 +1864,21 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
         probe.write_bytes(b"ok")
         probe.unlink()
     except OSError as e:
+        if isinstance(e, PermissionError) and str(folder).startswith("/Volumes/"):
+            raise QmcError(
+                f"输出目录被 macOS 隐私权限拦截: {folder}\n"
+                f"  原因: {e}\n"
+                f"  修复（任选其一）:\n"
+                f"    1) 双击包内的 Start-Mac.command 启动（经终端运行，可正常访问外部卷）\n"
+                f"    2) 系统设置 → 隐私与安全性 → 完全磁盘访问，把本程序（或终端）加入后重开\n"
+                f"    3) 终端执行: tccutil reset SystemPolicyRemovableVolumes 再重新运行，弹窗点“允许”\n"
+                f"    4) 或改用内置盘: --out-dir ~/Music/QQMusicDecrypted"
+            ) from e
         raise QmcError(
             f"输出目录不可写: {folder}\n"
             f"  原因: {e}\n"
-            f"  排查: 1) 外部磁盘可能只读挂载(NTFS/未启用写入)或已满；"
-            f"2) macOS 隐私权限——系统设置 → 隐私与安全性 → 文件与文件夹/完全磁盘访问，"
-            f"允许终端或本 App 访问“可移动卷宗”（从 Finder 双击运行未授权的二进制时常被拒）；"
-            f"3) 可先用 --out-dir 输出到本机目录（如 ~/Music/QQMusicDecrypted）"
+            f"  排查: 磁盘可能只读挂载(NTFS/未启用写入)、已满或权限不足；"
+            f"请改用 --out-dir 指向本机可写目录"
         ) from e
     ok = fail = skip = 0
     for i, song in enumerate(songs, 1):

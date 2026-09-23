@@ -1,2 +1,2 @@
-360c1ca75dcea06574ba57150a5ccd71f49ce24ac2227b604414302693d0c836  qqmusic-decrypt-macos-arm64.zip
-e70e2bb88d3bc250e60db70cbfa556ef1feade771d719d7c5e9872975b8db74e  qqmusic-decrypt-win64.zip
+f530b563c094e48daf93692f2ca4f1a759a3834a00ec8b42a66c2cdfbc4ef4cc  qqmusic-decrypt-macos-arm64.zip
+aca51925d43dae55f563a5dd96df2cc14b429b6579daf829446f01d6c8d25cc0  qqmusic-decrypt-win64.zip
