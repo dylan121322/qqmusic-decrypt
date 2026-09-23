@@ -1858,7 +1858,20 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
         for i, s in enumerate(songs, 1):
             print(f"  [dry-run] {i}/{len(songs)} {song_display(s)}")
         return
-    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".qqmusic_write_test"
+        probe.write_bytes(b"ok")
+        probe.unlink()
+    except OSError as e:
+        raise QmcError(
+            f"输出目录不可写: {folder}\n"
+            f"  原因: {e}\n"
+            f"  排查: 1) 外部磁盘可能只读挂载(NTFS/未启用写入)或已满；"
+            f"2) macOS 隐私权限——系统设置 → 隐私与安全性 → 文件与文件夹/完全磁盘访问，"
+            f"允许终端或本 App 访问“可移动卷宗”（从 Finder 双击运行未授权的二进制时常被拒）；"
+            f"3) 可先用 --out-dir 输出到本机目录（如 ~/Music/QQMusicDecrypted）"
+        ) from e
     ok = fail = skip = 0
     for i, song in enumerate(songs, 1):
         name = str(song.get("name") or "未知歌曲")
