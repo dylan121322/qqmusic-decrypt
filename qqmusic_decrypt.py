@@ -1389,6 +1389,59 @@ def convert_audio(src_path: str, dst_ext: str) -> str:
     return tmp
 
 
+def _expand_windows_vars(s: str) -> str:
+    """Windows 风格 %VAR% 展开（os.path.expandvars 在 POSIX 上不处理）。"""
+    def repl(m: "re.Match[str]") -> str:
+        return os.environ.get(m.group(1), m.group(0))
+    return re.sub(r"%([^%]+)%", repl, s)
+
+
+def normalize_user_path(raw: str) -> str:
+    """把用户输入的各种路径写法规范化为本机可用的路径字符串。
+
+    支持：单/双引号与中文引号包裹、shell 转义空格(\\ )、file:// URL、
+    ~ 与 $VAR/%VAR% 环境变量、/volumes 大小写、Windows 正反斜杠与 UNC。
+    不会破坏合法存在的含反斜杠路径（Mac 上反斜杠是合法文件名字符）。
+    """
+    s = (raw or "").strip().strip("\r\n")
+    for a, b in (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")):
+        if len(s) >= 2 and s[0] == a and s[-1] == b:
+            s = s[1:-1]
+            break
+    if s[:7].lower() == "file://":
+        try:
+            from urllib.parse import unquote, urlparse
+            u = urlparse(s)
+            s = unquote(u.path or "")
+            if u.netloc and u.netloc.lower() != "localhost":
+                s = f"//{u.netloc}{s}"  # 还原 UNC 风格
+        except Exception:  # noqa: BLE001
+            pass
+    if IS_WINDOWS:
+        s = _expand_windows_vars(s)
+    s = os.path.expandvars(s)
+    s = os.path.expanduser(s)
+    if not IS_WINDOWS:
+        if s.startswith("/volumes/"):
+            s = "/Volumes/" + s[len("/volumes/"):]
+        # shell 转义还原：仅当“字面路径”不存在时才还原，避免误伤合法反斜杠文件名
+        if "\\ " in s and not os.path.exists(s):
+            for esc, ch in (("\\ ", " "), ("\\(", "("), ("\\)", ")"),
+                            ("\\[", "["), ("\\]", "]"), ("\\&", "&"),
+                            ("\\'", "'"), ('\\"', '"')):
+                s = s.replace(esc, ch)
+    return s
+
+
+def probe_writable_dir(path: str) -> None:
+    """确认目录可创建且可写；失败抛 OSError。"""
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    probe = p / ".qqmusic_write_test"
+    probe.write_bytes(b"ok")
+    probe.unlink()
+
+
 def sanitize_name(name: str, max_len: int = 120) -> str:
     name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name).strip(" .")
     name = re.sub(r"\s+", " ", name)
@@ -1859,10 +1912,7 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
             print(f"  [dry-run] {i}/{len(songs)} {song_display(s)}")
         return
     try:
-        folder.mkdir(parents=True, exist_ok=True)
-        probe = folder / ".qqmusic_write_test"
-        probe.write_bytes(b"ok")
-        probe.unlink()
+        probe_writable_dir(str(folder))
     except OSError as e:
         if isinstance(e, PermissionError) and str(folder).startswith("/Volumes/"):
             raise QmcError(
@@ -2134,7 +2184,7 @@ class InteractiveCli:
         if ans in (None, "0"):
             return None
         if ans.lower() == "c":
-            path = self.ask("输入目录或文件路径: ")
+            path = normalize_user_path(self.ask("输入目录或文件路径: ") or "")
             if not path or not os.path.exists(path):
                 print("[错误] 路径不存在")
                 return None
@@ -2210,7 +2260,13 @@ class InteractiveCli:
                 cur = self.ask(f"输出目录 [{self.opts.out_dir}]: ",
                                self.opts.out_dir)
                 if cur:
-                    self.opts.out_dir = os.path.expanduser(cur)
+                    new_dir = normalize_user_path(cur)
+                    try:
+                        probe_writable_dir(new_dir)
+                        self.opts.out_dir = new_dir
+                        print(f"  输出目录: {new_dir}（已确认可写）")
+                    except OSError as e:
+                        print(f"[错误] 目录不可写，未修改: {new_dir}\n  原因: {e}")
             elif ans == "3":
                 cur = self.ask(f"每歌单/每批上限（0=全部）[{self.opts.limit}]: ",
                                str(self.opts.limit))
@@ -2234,7 +2290,7 @@ class InteractiveCli:
             elif ans == "7":
                 cur = self.ask(f"报错日志文件 [{LOG_FILE or ''}]: ")
                 if cur:
-                    self.opts.log_file = os.path.expanduser(cur)
+                    self.opts.log_file = normalize_user_path(cur)
                     log_info(f"日志路径变更为 {init_logging(self.opts.log_file)}")
                     print(f"  日志文件: {LOG_FILE}")
             elif ans == "8":
@@ -2343,6 +2399,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         API_PLATFORM = opts.platform
     if opts.proxy:
         os.environ["QQMUSIC_PROXY"] = opts.proxy
+    # 路径统一归一化（兼容引号/shell 转义/file:// /~/%VAR%，Windows 与 Mac）
+    opts.out_dir = normalize_user_path(opts.out_dir)
+    if opts.log_file:
+        opts.log_file = normalize_user_path(opts.log_file)
+    if getattr(opts, "db", ""):
+        opts.db = normalize_user_path(opts.db)
+    if getattr(opts, "prefs", None):
+        opts.prefs = normalize_user_path(opts.prefs)
+    if opts.paths:
+        opts.paths = [normalize_user_path(p) for p in opts.paths]
     log_path = init_logging(opts.log_file)
     log_info(f"=== 会话开始 pid={os.getpid()} platform={API_PLATFORM} "
              f"is_windows={IS_WINDOWS} log={log_path}")

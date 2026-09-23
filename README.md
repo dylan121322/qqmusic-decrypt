@@ -187,6 +187,20 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 - 交互菜单 [6] 设置页可查看/修改日志路径；日志写入失败不影响主流程。
 
 
+### 路径写法兼容（macOS / Windows）
+
+输出目录、日志路径、本地扫描路径均会自动归一化，支持：
+
+- 引号包裹：`"/Volumes/NO NAME/x"`、`'E:\project\out'`、中文引号“…”；
+- shell 转义空格：`/Volumes/NO\ NAME/x` → `/Volumes/NO NAME/x`；
+- `file://` URL：`file:///Volumes/NO%20NAME/x`；
+- `~` 与 `$VAR`；Windows `%VAR%`（如 `%USERPROFILE%\Music`）；
+- macOS `/volumes` 小写自动纠正为 `/Volumes`；
+- Windows 正/反斜杠与 UNC（`\\NAS\share\music`）；
+- 交互设置输入后**立即探测可写性**，不可写不会覆盖原值并给出原因。
+
+示例：Mac `~/Music`、`/Volumes/NO\ NAME/mu`；Win `E:\project\out`、`%USERPROFILE%\Music`、`C:/Users/x/Music`。
+
 ### macOS 写入外部卷报 Permission denied（TCC 拦截）
 
 现象：输出目录选在 `/Volumes/...` 外部磁盘时，工具提示“输出目录被 macOS 隐私权限拦截”，
