@@ -118,6 +118,7 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 | `--tag` / `--no-tag` | 是否用 ffmpeg 写标题/歌手/专辑（默认开，失败不致命） |
 | `--no-ffprobe` | 不做 ffprobe 时长验证 |
 | `--log-file FILE` | 报错日志文件（默认 `<输出目录>/qqmusic_decrypt.log`） |
+| `--proxy URL` | 显式 HTTP(S) 代理（如 `http://127.0.0.1:10808`）；默认绕过系统代理 |
 | `--delay S` | API 调用间隔（默认 0.15s） |
 | `--db / --prefs` | 覆盖 sqlite / plist 路径 |
 | `--uin U --authst A` | 手动凭据（跳过自动凭据） |
@@ -193,6 +194,9 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
   未购买付费单曲（`price_track>0` 且未购买）、版权方限制（仅试听）或歌曲已下架，
   这不是工具 bug；购买后重试即可（部分翻唱/UGC 曲目购买也不可下载）；
 - 下载对网络中断（IncompleteRead）自动重试 3 次，并回退多个 CDN 域名；
+- API 请求遇到网络瞬断（SSLEOF/超时/连接重置）自动重试 3 次；
+  **默认绕过系统代理**（macOS 系统代理失效会触发 `SSLEOFError`），需要代理时用 `--proxy` 指定；
+- 交互模式下任何异常都会回到菜单并写入日志，不会直接退出；
 - 单个 `.mgg` 缓存可能需要最多 4 次 API 探测（O8M0→O4M0→O6M0→M8M0）；
 - 歌单下载速度受 API 间隔与 CDN 带宽影响；`--quality flac` 单音质可减少 API 次数；
 - 单线程；本地 24MB `.mflac` 约 6s，歌单每首含下载+解密+ffmpeg 标签；

@@ -927,12 +927,23 @@ def load_credentials(opts) -> Credentials:
 _warned_ssl = False
 
 
+def _proxy_config() -> dict:
+    """默认绕过系统代理（macOS 系统代理失效会导致 SSLEOF）；
+    如需代理用 --proxy 或环境变量 QQMUSIC_PROXY 显式指定。"""
+    p = (os.environ.get("QQMUSIC_PROXY") or "").strip()
+    if p:
+        return {"http": p, "https": p}
+    return {}
+
+
 def _urlopen(req: urllib.request.Request, timeout: int = 60):
     global _warned_ssl
 
-    def _open(verify: bool):
+    def _opener(verify: bool):
         ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
-        return urllib.request.urlopen(req, context=ctx, timeout=timeout)
+        handlers = [urllib.request.ProxyHandler(_proxy_config()),
+                    urllib.request.HTTPSHandler(context=ctx)]
+        return urllib.request.build_opener(*handlers)
 
     def _warn():
         global _warned_ssl
@@ -942,18 +953,18 @@ def _urlopen(req: urllib.request.Request, timeout: int = 60):
             _warned_ssl = True
 
     try:
-        return _open(True)
+        return _opener(True).open(req, timeout=timeout)
     except ssl.SSLCertVerificationError:
         _warn()
-        return _open(False)
+        return _opener(False).open(req, timeout=timeout)
     except urllib.error.URLError as e:
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             _warn()
-            return _open(False)
+            return _opener(False).open(req, timeout=timeout)
         raise
 
 
-def _http_post_json(url: str, body: dict) -> dict:
+def _http_post_json(url: str, body: dict, retries: int = 3) -> dict:
     req = urllib.request.Request(
         url,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -963,8 +974,20 @@ def _http_post_json(url: str, body: dict) -> dict:
             "Referer": "https://y.qq.com/",
         },
     )
-    with _urlopen(req, timeout=30) as resp:
-        raw = resp.read()
+    raw: Optional[bytes] = None
+    last: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            with _urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+            break
+        except Exception as e:  # noqa: BLE001  网络瞬断(SSLEOF/超时/重置)统一重试
+            last = e
+            if attempt + 1 < retries:
+                log_warning(f"API 请求失败，第 {attempt + 1}/{retries} 次重试: {e}")
+                time.sleep(1.5 * (attempt + 1))
+    if raw is None:
+        raise ApiError(f"API 请求失败（已重试 {retries} 次）: {last}")
     try:
         return json.loads(raw.decode("utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -1788,6 +1811,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="进入交互式菜单")
     p.add_argument("--log-file", default=None,
                    help="报错日志文件（默认 <输出目录>/qqmusic_decrypt.log）")
+    p.add_argument("--proxy", default=None,
+                   help="HTTP(S) 代理（如 http://127.0.0.1:10808）；默认绕过系统代理")
     p.add_argument("--debug-tools", action="store_true",
                    help="打印内置 ffmpeg/ffprobe 定位与版本后退出")
     p.add_argument("--self-test", action="store_true", help="运行内置自测后退出")
@@ -2274,6 +2299,10 @@ class InteractiveCli:
                     print("[错误] 无效选择，输入 0-9")
             except QmcError as e:
                 print(f"[错误] {e}")
+                log_error(f"交互操作失败: {e}")
+            except Exception as e:  # noqa: BLE001  任何异常都回到菜单，不退出程序
+                print(f"[错误] 未预期异常: {e!r}")
+                log_error(f"交互操作未预期异常: {e!r}", exc_info=True)
             self.pause()
 
 
@@ -2291,6 +2320,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global API_PLATFORM
     if opts.platform != "auto":
         API_PLATFORM = opts.platform
+    if opts.proxy:
+        os.environ["QQMUSIC_PROXY"] = opts.proxy
     log_path = init_logging(opts.log_file)
     log_info(f"=== 会话开始 pid={os.getpid()} platform={API_PLATFORM} "
              f"is_windows={IS_WINDOWS} log={log_path}")
@@ -2332,6 +2363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     remote_requested = bool(opts.list_playlists or opts.playlist or opts.favorites)
     ctx = BatchContext(opts)
     results: List[Result] = []
+    remote_error: Optional[Exception] = None
     try:
         # 1) 本地加密文件解密（显式 paths 才做；缺省目录扫描只在纯本地模式启用）
         files: List[str] = []
@@ -2356,24 +2388,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # 2) 在线歌单 / 我喜欢
         if remote_requested:
-            creds = ctx.get_creds()
-            if opts.list_playlists:
-                print_playlists(creds)
-            tasks: List[Tuple[int, str]] = []
-            if opts.favorites:
-                tasks.append((resolve_favorites_tid(creds), "我喜欢"))
-            for tid in opts.playlist:
-                tasks.append((int(tid), f"歌单{tid}"))
-            seen: set = set()
-            ordered: List[Tuple[int, str]] = []
-            for t in tasks:
-                if t[0] not in seen:
-                    seen.add(t[0])
-                    ordered.append(t)
-            for tid, label in ordered:
-                download_playlist_songs(ctx, tid, label, results)
-                if ctx.stop:
-                    break
+            try:
+                creds = ctx.get_creds()
+                if opts.list_playlists:
+                    print_playlists(creds)
+                tasks: List[Tuple[int, str]] = []
+                if opts.favorites:
+                    tasks.append((resolve_favorites_tid(creds), "我喜欢"))
+                for tid in opts.playlist:
+                    tasks.append((int(tid), f"歌单{tid}"))
+                seen: set = set()
+                ordered: List[Tuple[int, str]] = []
+                for t in tasks:
+                    if t[0] not in seen:
+                        seen.add(t[0])
+                        ordered.append(t)
+                for tid, label in ordered:
+                    download_playlist_songs(ctx, tid, label, results)
+                    if ctx.stop:
+                        break
+            except Exception as e:  # noqa: BLE001  在线任务异常不崩溃，记录后退出
+                remote_error = e
+                print(f"\n[错误] 在线任务失败: {e}", file=sys.stderr)
+                log_error(f"在线任务失败: {e!r}", exc_info=True)
     finally:
         ctx.close()
 
@@ -2388,6 +2425,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for r in fail:
             print(f"  FAIL {r.path}: {r.message}", file=sys.stderr)
             log_error(f"FAIL {r.path}: {r.message}")
+        return 1
+    if remote_error is not None:
         return 1
     return 0
 
