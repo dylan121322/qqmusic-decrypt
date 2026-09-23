@@ -44,7 +44,7 @@ QQ 音乐 QMC 加密音频**批量解密 + 歌单/我喜欢下载**工具（macO
 cd ~/project/qqmusic-decrypt
 
 # 1. 交互式菜单（无参数直接进入；带参数仍是脚本化批处理）
-#    主菜单 [8] 可快速切换下载输出格式，[6] 设置页含全部选项
+#    主菜单 [8] 切换输出格式，[9] 本地音频格式转换，[6] 设置页含全部选项
 python3 qqmusic_decrypt.py
 
 # 2. 自测（不联网、不读写歌曲文件）
@@ -75,6 +75,10 @@ python3 qqmusic_decrypt.py --favorites --quality flac
 
 # 10. 下载后自动转格式（默认 auto=保持源格式；可选 auto/flac/mp3/m4a/ogg/opus/wav）
 python3 qqmusic_decrypt.py --favorites --format mp3
+
+# 11. 独立格式转换（普通音频文件/目录，内置 ffmpeg）
+python3 qqmusic_decrypt.py --convert --format flac ~/Music/某目录
+python3 qqmusic_decrypt.py --convert --format mp3 song.wav song.m4a
 ```
 
 ### macOS 打包版被 Gatekeeper 拦截的解决方法
@@ -107,7 +111,8 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 | `--playlist TID` | 下载指定歌单（可重复） |
 | `--favorites` | 下载「我喜欢」 |
 | `--quality LIST` | 下载音质优先级，默认 `flac,320,192,128,m4a` |
-| `--format FMT` | 下载输出格式：`auto/flac/mp3/m4a/ogg/opus/wav`（下载后用内置 ffmpeg 转换） |
+| `--format FMT` | 输出格式：`auto/flac/mp3/m4a/ogg/opus/wav`；作用于下载与本地解密产物（内置 ffmpeg 转换） |
+| `--convert` | 独立转换模式：把 paths 里的普通音频转为 `--format` 指定格式 |
 | `--limit N` | 本地模式最多处理 N 个文件；歌单模式每歌单最多 N 首 |
 | `--out-dir DIR` | 输出目录（默认 `~/Music/QQMusicDecrypted`；歌单按「歌单名/」分子目录） |
 | `--in-place` | 本地模式输出到源文件同目录 |

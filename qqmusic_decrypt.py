@@ -115,6 +115,11 @@ SUPPORTED_EXTS = {
     ".qmc0", ".qmc2", ".qmc3", ".qmcflac", ".qmcogg",
     ".bkcmp3", ".bkcflac", ".tkm",
 }
+# 可直接用 ffmpeg 转换的普通音频后缀
+PLAIN_AUDIO_EXTS = {
+    ".mp3", ".flac", ".m4a", ".m4b", ".aac", ".ogg", ".oga", ".opus",
+    ".wav", ".aiff", ".aif", ".wma", ".ape", ".alac",
+}
 LEGACY_EXTS = {
     ".qmc0", ".qmc2", ".qmc3", ".qmcflac", ".qmcogg",
     ".bkcmp3", ".bkcflac", ".tkm",
@@ -1375,6 +1380,7 @@ def convert_audio(src_path: str, dst_ext: str) -> str:
         raise QmcError("未找到 ffmpeg，无法转换格式")
     tmp = f"{src_path}.conv.{dst_ext}"  # 保留扩展名供 ffmpeg 推断容器
     cmd = [ffmpeg, "-v", "error", "-y", "-i", src_path,
+           "-map_metadata", "0",  # 尽量保留标题/歌手/专辑/封面
            *CONVERT_ARGS[dst_ext], tmp]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -1387,6 +1393,36 @@ def convert_audio(src_path: str, dst_ext: str) -> str:
             os.remove(tmp)
         raise QmcError(f"ffmpeg 转换失败: {(r.stderr or b'').decode('utf-8', 'replace')[-300:]}")
     return tmp
+
+
+def save_audio_with_conversion(audio: bytes, folder: Path, stem: str,
+                               src_ext: str, want_ext: str,
+                               overwrite: bool) -> Tuple[Path, str]:
+    """写入音频；want_ext 非 auto 时用内置 ffmpeg 转换。
+
+    返回 (最终路径, 备注)。转换失败会保留源格式并记录日志。
+    """
+    final_ext = src_ext if (not want_ext or want_ext == "auto") else want_ext
+    out_path = folder / f"{stem}.{final_ext}"
+    if final_ext == src_ext:
+        out_path.write_bytes(audio)
+        return out_path, ""
+    src_tmp = str(out_path) + f".src{src_ext}"
+    Path(src_tmp).write_bytes(audio)
+    try:
+        conv_tmp = convert_audio(src_tmp, final_ext)
+        os.replace(conv_tmp, out_path)
+        os.remove(src_tmp)
+        return out_path, f" 转{final_ext.upper()}"
+    except QmcError as ce:
+        log_warning(f"{stem}: 转换失败，保留源格式: {ce}")
+        fallback = folder / f"{stem}.{src_ext}"
+        n = 1
+        while fallback.exists() and not overwrite:
+            fallback = folder / f"{stem} ({n}).{src_ext}"
+            n += 1
+        os.replace(src_tmp, fallback)
+        return fallback, " 转换失败保留源格式"
 
 
 def _expand_windows_vars(s: str) -> str:
@@ -1610,6 +1646,9 @@ def process_file(path: str, ctx: BatchContext, idx: int, total: int) -> Result:
             ".qmc0": ".mp3", ".qmc3": ".mp3", ".bkcmp3": ".mp3",
             ".tkm": ".m4a",
         }.get(info.ext)
+        _want = str(getattr(opts, "out_format", "auto") or "auto")
+        if _want != "auto":
+            _guess = _want  # 指定了转换格式，按目标扩展名判断是否已转换过
         if _guess and not opts.overwrite:
             _cand = pick_output_path(
                 opts.out_dir if not opts.in_place else str(src.parent),
@@ -1657,17 +1696,22 @@ def process_file(path: str, ctx: BatchContext, idx: int, total: int) -> Result:
         if out_ext == ".mp3" and info.ext in (".mflac", ".qmcflac", ".bkcflac"):
             raise QmcError(f"期望无损文件却得到 MP3 签名（{out_ext}），可能用错 ekey")
 
-        out_path = pick_output_path(
-            opts.out_dir if not opts.in_place else str(src.parent),
-            src, title, out_ext, opts.in_place,
-        )
-        if os.path.exists(out_path) and not opts.overwrite:
-            print(f"[{idx}/{total}] SKIP {path}  输出已存在: {out_path}")
-            return Result(path, "skip", f"输出已存在: {out_path}")
-        Path(out_path).write_bytes(out)
+        want_ext = str(getattr(opts, "out_format", "auto") or "auto")
+        final_ext = out_ext if want_ext == "auto" else want_ext
+        base_dir = Path(opts.out_dir if not opts.in_place else str(src.parent))
+        stem = (src.name.rsplit(".", 1)[0] if opts.in_place
+                else (sanitize_name(title) if title else src.name.rsplit(".", 1)[0]))
+        cand = base_dir / f"{stem}{final_ext}"
+        if cand.exists() and not opts.overwrite:
+            print(f"[{idx}/{total}] SKIP {path}  输出已存在: {cand}")
+            return Result(path, "skip", f"输出已存在: {cand}")
+        base_dir.mkdir(parents=True, exist_ok=True)
+        out_path, note = save_audio_with_conversion(
+            bytes(out), base_dir, stem, out_ext, want_ext, opts.overwrite)
+        out_path = str(out_path)
 
         dur = ffprobe_duration(out_path) if not opts.no_ffprobe else None
-        msg = f"{out_ext[1:].upper()} {os.path.getsize(out_path)}B"
+        msg = f"{Path(out_path).suffix[1:].upper()} {os.path.getsize(out_path)}B{note}"
         if dur is not None:
             msg += f" {dur:.1f}s"
         print(f"[{idx}/{total}] OK  {out_path}  ({msg})")
@@ -1704,6 +1748,83 @@ def discover(inputs: Sequence[str], recursive: bool) -> List[str]:
                     if os.path.isfile(p) and Path(n).suffix.lower() in SUPPORTED_EXTS:
                         files.append(p)
     return sorted(set(os.path.abspath(f) for f in files))
+
+
+def discover_audio(inputs: Sequence[str], recursive: bool) -> List[str]:
+    """收集普通音频文件（用于独立格式转换）。"""
+    files: List[str] = []
+    for item in inputs:
+        if os.path.isfile(item):
+            if Path(item).suffix.lower() in PLAIN_AUDIO_EXTS:
+                files.append(item)
+        elif os.path.isdir(item):
+            if recursive:
+                for root, _dirs, names in os.walk(item):
+                    for n in sorted(names):
+                        if Path(n).suffix.lower() in PLAIN_AUDIO_EXTS:
+                            files.append(os.path.join(root, n))
+            else:
+                for n in sorted(os.listdir(item)):
+                    p = os.path.join(item, n)
+                    if os.path.isfile(p) and Path(n).suffix.lower() in PLAIN_AUDIO_EXTS:
+                        files.append(p)
+    return sorted(set(os.path.abspath(f) for f in files))
+
+
+def convert_file_list(files: Sequence[str], opts: argparse.Namespace) -> Tuple[int, int, int]:
+    """把文件列表转换为 opts.out_format，返回 (成功, 跳过, 失败)。"""
+    out_dir = Path(opts.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ok = fail = skip = 0
+    for i, f in enumerate(files, 1):
+        try:
+            src = Path(f)
+            src_ext = src.suffix.lower()
+            if src_ext == f".{opts.out_format}":
+                print(f"[{i}/{len(files)}] SKIP {src.name}（已是目标格式）")
+                skip += 1
+                continue
+            dst = out_dir / f"{sanitize_name(src.stem)}.{opts.out_format}"
+            if dst.exists() and not opts.overwrite:
+                print(f"[{i}/{len(files)}] SKIP {src.name}（输出已存在: {dst}）")
+                skip += 1
+                continue
+            conv_tmp = convert_audio(str(src), opts.out_format)
+            os.replace(conv_tmp, dst)
+            dur = ffprobe_duration(str(dst)) if not opts.no_ffprobe else None
+            msg = f"{opts.out_format.upper()} {os.path.getsize(dst)}B"
+            if dur is not None:
+                msg += f" {dur:.1f}s"
+            print(f"[{i}/{len(files)}] OK  {dst}  ({msg})")
+            log_info(f"转换成功: {src} -> {dst}")
+            ok += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[{i}/{len(files)}] FAIL {f}  {e}", file=sys.stderr)
+            log_error(f"转换失败 {f}: {e!r}", exc_info=not isinstance(e, QmcError))
+            fail += 1
+    return ok, skip, fail
+
+
+def run_convert_mode(opts: argparse.Namespace) -> int:
+    """独立格式转换：把普通音频文件用内置 ffmpeg 转成 --format 指定格式。"""
+    if opts.out_format == "auto":
+        print("[错误] 独立转换模式必须指定 --format（如 --format mp3）", file=sys.stderr)
+        return 2
+    if not opts.paths:
+        print("[错误] 请指定要转换的文件或目录", file=sys.stderr)
+        return 2
+    files = discover_audio(opts.paths, opts.recursive)
+    if not files:
+        print("没有找到可转换的音频文件。")
+        return 0
+    try:
+        probe_writable_dir(opts.out_dir)
+    except OSError as e:
+        print(f"[错误] 输出目录不可写: {opts.out_dir} -> {e}", file=sys.stderr)
+        return 1
+    ok, skip, fail = convert_file_list(files, opts)
+    print(f"\n转换完成: 成功 {ok}, 跳过 {skip}, 失败 {fail}, 输出目录 {opts.out_dir}")
+    return 1 if fail else 0
 
 
 def run_self_test() -> None:
@@ -1855,7 +1976,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="下载音质优先级，逗号分隔：flac,320,192,128,m4a,mp3-128,mp3-320")
     p.add_argument("--format", dest="out_format", default="auto",
                    choices=sorted(OUTPUT_FORMATS),
-                   help="下载输出格式（auto=保持源格式，其余用内置 ffmpeg 转换）")
+                   help="输出格式（下载/本地解密转换用；auto=保持源格式，其余用内置 ffmpeg 转换）")
+    p.add_argument("--convert", action="store_true",
+                   help="独立格式转换模式：把 paths 中的普通音频转为 --format 指定格式")
     p.add_argument("--tag", dest="tag", action="store_true", default=True,
                    help="用 ffmpeg 写入标题/歌手/专辑标签（默认开，失败不报错）")
     p.add_argument("--no-tag", dest="tag", action="store_false",
@@ -1947,29 +2070,8 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
                 results.append(Result(f"{artists} - {name}", "skip",
                                       f"输出已存在: {out_path}"))
                 continue
-            note = ""
-            if final_ext == ext:
-                out_path.write_bytes(audio)
-            else:
-                # 下载源文件 → ffmpeg 转换 → 替换为最终格式；失败保留源格式
-                src_tmp = str(out_path) + f".src{ext}"
-                Path(src_tmp).write_bytes(audio)
-                try:
-                    conv_tmp = convert_audio(src_tmp, final_ext)
-                    os.replace(conv_tmp, out_path)
-                    os.remove(src_tmp)
-                    note = f" 转{final_ext.upper()}"
-                except QmcError as ce:
-                    log_warning(f"[{i}/{len(songs)}] {artists} - {name} 转换失败，"
-                                f"保留源格式: {ce}")
-                    fallback = folder / f"{fname}.{ext}"
-                    n = 1
-                    while fallback.exists() and not opts.overwrite:
-                        fallback = folder / f"{fname} ({n}).{ext}"
-                        n += 1
-                    os.replace(src_tmp, fallback)
-                    out_path = fallback
-                    note = " 转换失败保留源格式"
+            out_path, note = save_audio_with_conversion(
+                audio, folder, fname, ext, want_ext, opts.overwrite)
             if opts.tag:
                 apply_tags(str(out_path), name, artists, album)
             dur = ffprobe_duration(str(out_path)) if not opts.no_ffprobe else None
@@ -2018,8 +2120,9 @@ MENU_MAIN = """
   [5] 本地文件预演 / 格式查看
   [6] 设置（音质 / 输出目录 / 上限 / 标签…）
   [7] 运行自测
-  [8] 下载输出格式    当前: {out_format}
-  [9] 帮助
+  [8] 下载/解密输出格式    当前: {out_format}
+  [9] 本地音频格式转换（内置 ffmpeg）
+  [10] 帮助
   [0] 退出"""
 
 MENU_SETTINGS = """
@@ -2317,9 +2420,12 @@ class InteractiveCli:
   python3 qqmusic_decrypt.py --favorites --limit 1
   python3 qqmusic_decrypt.py --playlist <tid> --quality flac
   python3 qqmusic_decrypt.py ~/Downloads --dry-run
+  python3 qqmusic_decrypt.py --favorites --format mp3          # 下载后转 mp3
+  python3 qqmusic_decrypt.py --convert --format flac <文件/目录>  # 独立转换普通音频
   python3 qqmusic_decrypt.py --self-test
 
 提示：
+  - 格式转换全部使用内置 ffmpeg（无需系统安装）；
   - 歌单下载默认输出到 <输出目录>/<歌单名>/；
   - 重复运行自动 SKIP 已存在文件；
   - authst 过期会提示重新登录 QQ 音乐；
@@ -2328,16 +2434,58 @@ class InteractiveCli:
 
 
     def do_format_quick(self):
-        """主菜单直达：选择下载输出格式。"""
+        """主菜单直达：选择下载/解密输出格式。"""
         print("  可选格式: " + ", ".join(
             f"{k}({v})" for k, v in OUTPUT_FORMATS.items()))
-        cur = self.ask(f"下载输出格式 [{self.opts.out_format}]: ",
+        cur = self.ask(f"输出格式 [{self.opts.out_format}]: ",
                        self.opts.out_format)
         if cur and cur.strip().lower() in OUTPUT_FORMATS:
             self.opts.out_format = cur.strip().lower()
             print(f"  输出格式: {OUTPUT_FORMATS[self.opts.out_format]}")
         else:
             print("[错误] 格式无效")
+
+    def do_convert_interactive(self):
+        """交互式：用内置 ffmpeg 转换本地普通音频文件。"""
+        if self.opts.out_format == "auto":
+            print("当前输出格式为 auto，请先用主菜单 [8] 或设置 [8] 选择目标格式")
+            return
+        print(f"目标格式: {OUTPUT_FORMATS[self.opts.out_format]}")
+        print("  [1] ~/Downloads")
+        print("  [2] 自定义文件 / 目录")
+        print("  [0] 返回")
+        ans = self.ask("选择来源: ")
+        if ans in (None, "0"):
+            return
+        if ans == "1":
+            paths: List[str] = [os.path.expanduser("~/Downloads")]
+            rec = self.opts.recursive
+        elif ans == "2":
+            raw = self.ask("输入文件或目录路径（支持引号/转义/~/file://）: ")
+            p = normalize_user_path(raw or "")
+            if not p or not os.path.exists(p):
+                print("[错误] 路径不存在")
+                return
+            paths = [p]
+            rec = self.confirm("递归扫描子目录？") if os.path.isdir(p) else False
+        else:
+            print("[错误] 选择无效")
+            return
+        files = discover_audio(paths, rec)
+        if not files:
+            print("没有找到可转换的音频文件。")
+            return
+        print(f"发现 {len(files)} 个音频文件，输出目录: {self.opts.out_dir}")
+        if len(files) > 5 and not self.confirm("确认开始转换？"):
+            print("已取消。")
+            return
+        try:
+            probe_writable_dir(self.opts.out_dir)
+        except OSError as e:
+            print(f"[错误] 输出目录不可写: {self.opts.out_dir} -> {e}")
+            return
+        ok, skip, fail = convert_file_list(files, self.opts)
+        print(f"  转换完成: 成功 {ok}, 跳过 {skip}, 失败 {fail}")
 
     def run(self):
         print(MENU_BANNER)
@@ -2371,9 +2519,11 @@ class InteractiveCli:
                 elif ans == "8":
                     self.do_format_quick()
                 elif ans == "9":
+                    self.do_convert_interactive()
+                elif ans == "10":
                     self.show_help()
                 else:
-                    print("[错误] 无效选择，输入 0-9")
+                    print("[错误] 无效选择，输入 0-10")
             except QmcError as e:
                 print(f"[错误] {e}")
                 log_error(f"交互操作失败: {e}")
@@ -2440,6 +2590,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"  rc={r.returncode} out={r.stdout[:80]!r} "
                       f"err={r.stderr[:120]!r}")
         return 0
+
+    if opts.convert:
+        return run_convert_mode(opts)
 
     # 无参数启动 → 交互式菜单；显式 -i/--interactive 同
     no_args = (argv is None and len(sys.argv) == 1) or (
