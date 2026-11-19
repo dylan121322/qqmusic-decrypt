@@ -179,6 +179,10 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 
 （校验和见 `release/SHA256SUMS.txt`）
 
+GitHub Releases 的资产由 CI 构建：推 `v*` tag 触发 `.github/workflows/release.yml`，
+在 GitHub 官方 runner 上分别打包 macOS arm64 / Windows x64（内置 ffmpeg/ffprobe），
+跑内置 `--self-test` 后生成 `SHA256SUMS.txt` 并上传到该 tag 的 draft Release，人工核对后发布。
+
 > ⚠️ **macOS 首次运行**：二进制未签名，会被 Gatekeeper 拦截。解压后先执行
 > `xattr -dr com.apple.quarantine <解压目录>`，再 `chmod +x qqmusic-decrypt-mac`
 > （或 Finder 右键 → 打开）。详见上文“macOS 打包版被 Gatekeeper 拦截的解决方法”。

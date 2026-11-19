@@ -1,0 +1,166 @@
+name: release
+
+# 打 tag（v*）即触发：macOS arm64 + Windows x64 双端 PyInstaller 打包（内置 ffmpeg/ffprobe），
+# 跑内置自测，把 zip + SHA256SUMS.txt 传到该 tag 的 **draft** Release。
+# 人工核对资产后再 `gh release edit <tag> --draft=false` 发布。
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            pkgdir: qqmusic-decrypt-macos-arm64
+          - name: win64
+            os: windows-latest
+            pkgdir: qqmusic-decrypt-win64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller>=6,<7"
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg || brew upgrade ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP "ffmpeg") -Force
+          $exe = Get-ChildItem (Join-Path $env:RUNNER_TEMP "ffmpeg") -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw "未找到 ffmpeg.exe" }
+          "FFMPEG_BIN=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "FFMPEG_BIN=$($exe.DirectoryName)"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          QQMUSIC_FFMPEG: /opt/homebrew/bin/ffmpeg
+          QQMUSIC_FFPROBE: /opt/homebrew/bin/ffprobe
+        run: python -m PyInstaller --noconfirm --clean qqmusic-decrypt-mac.spec
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: python -m PyInstaller --noconfirm --clean qqmusic_decrypt_win.spec
+
+      # 自测会真正调用内置 ffmpeg/ffprobe（含"同名不同版本判定"用例），可验证打包是否完整
+      - name: Self-test bundled binary (macOS)
+        if: runner.os == 'macOS'
+        run: ./dist/qqmusic-decrypt-mac --self-test
+
+      - name: Self-test bundled binary (Windows)
+        if: runner.os == 'Windows'
+        run: .\dist\qqmusic-decrypt-win.exe --self-test
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          d="pkg/${{ matrix.pkgdir }}"
+          mkdir -p "$d"
+          cp dist/qqmusic-decrypt-mac "$d/"
+          cp README.md TECHNICAL.md DISCLAIMER.md LICENSE Start-Mac.command "$d/"
+          chmod +x "$d/qqmusic-decrypt-mac" "$d/Start-Mac.command"
+          cd pkg && zip -qry "../${{ matrix.pkgdir }}.zip" "${{ matrix.pkgdir }}"
+          cd .. && unzip -l "${{ matrix.pkgdir }}.zip"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $d = "pkg/${{ matrix.pkgdir }}"
+          New-Item -ItemType Directory -Force -Path $d | Out-Null
+          Copy-Item dist/qqmusic-decrypt-win.exe $d/
+          Copy-Item README.md,TECHNICAL.md,DISCLAIMER.md,LICENSE $d/
+          Compress-Archive -Path $d -DestinationPath "${{ matrix.pkgdir }}.zip" -Force
+          Get-Item "${{ matrix.pkgdir }}.zip" | Select-Object Name,Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.pkgdir }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish-draft-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: assets
+
+      - name: SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum *.zip | tee SHA256SUMS.txt
+
+      # 没有手写发布说明时，用上次 tag 到本次 tag 的提交列表兜底
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          f="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$f" ]; then
+            mkdir -p docs/release-notes
+            prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+            {
+              echo "## ${GITHUB_REF_NAME}"
+              echo
+              if [ -n "$prev" ]; then
+                git log --no-merges --pretty='- %s' "${prev}..${GITHUB_REF_NAME}"
+              else
+                git log -20 --no-merges --pretty='- %s'
+              fi
+            } > "$f"
+          fi
+          cat "$f"
+
+      - name: Create/update draft release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: docs/release-notes/${{ github.ref_name }}.md
+          files: |
+            assets/qqmusic-decrypt-macos-arm64.zip
+            assets/qqmusic-decrypt-win64.zip
+            assets/SHA256SUMS.txt
+          fail_on_unmatched_files: true
