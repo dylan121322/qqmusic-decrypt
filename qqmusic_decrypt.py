@@ -719,7 +719,8 @@ def ffprobe_duration(path: str) -> Optional[float]:
         r = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
         )
         if r.returncode == 0:
             return float(r.stdout.strip())
@@ -758,7 +759,8 @@ def media_tags_and_duration(path: str) -> Tuple[Optional[float], Dict[str, str]]
             [ffprobe, "-v", "error", "-show_entries",
              "format=duration:format_tags:stream_tags",
              "-of", "json", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
         )
         if r.returncode != 0:
             return None, {}
@@ -815,7 +817,8 @@ def audio_content_md5(source: Any) -> Optional[str]:
     try:
         r = subprocess.run(
             [ffmpeg, "-v", "error", "-i", target, "-map", "0:a:0", "-f", "md5", "-"],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=300,
         )
         if r.returncode == 0:
             m = re.search(r"MD5=([0-9a-f]{32})", r.stdout or "")
@@ -2923,7 +2926,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"{name}: {p}")
             if p:
                 r = subprocess.run([p, "-version"], capture_output=True,
-                                   text=True, timeout=30)
+                                   text=True, encoding="utf-8", errors="replace",
+                                   timeout=30)
                 print(f"  rc={r.returncode} out={r.stdout[:80]!r} "
                       f"err={r.stderr[:120]!r}")
         return 0
