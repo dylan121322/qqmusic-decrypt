@@ -30,7 +30,7 @@ QQ 音乐 QMC 加密音频**批量解密 + 歌单/我喜欢下载**工具（macO
 | 歌单详情/分页歌曲 | `music.srfDissInfo.DissInfo.CgiGetDiss`（`song_num=50` 分页） |
 | 加密资源下载+解密 | `GetEVkey`（F0M0/O8M0/O6M0/O4M0）→ 下载 purl → QMC2 解密 |
 | 普通音质兜底 | `CgiGetVkey`（C400/M500/M800）直接下载 |
-| 音频标签 | ffmpeg 写入标题/歌手/专辑（可选） |
+| 音频标签 | ffmpeg 写入标题/歌手/专辑（可选）+ 歌曲指纹 `qqmusic_songmid` |
 
 算法实现与验证：
 - 腾讯魔改 TEA：16 轮、tweaked CBC（`PadLen+Padding+Salt+Body+Zero7` 帧），已通过
@@ -116,7 +116,7 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 | `--limit N` | 本地模式最多处理 N 个文件；歌单模式每歌单最多 N 首 |
 | `--out-dir DIR` | 输出目录（默认 `~/Music/QQMusicDecrypted`；歌单按「歌单名/」分子目录） |
 | `--in-place` | 本地模式输出到源文件同目录 |
-| `--overwrite` | 覆盖已存在输出（默认 SKIP） |
+| `--overwrite` | 覆盖已存在输出（默认按指纹 SKIP 同一首） |
 | `--recursive` | 目录递归（iMusic 库默认自动递归） |
 | `--dry-run` / `--info` | 预演 / 只看格式信息 |
 | `--no-api` | 禁用 API（只解内嵌 ekey / 静态格式） |
@@ -139,11 +139,22 @@ chmod +x ~/Downloads/qqmusic-decrypt-macos-arm64/qqmusic-decrypt-mac
 - Windows 客户端请自行取 `uin`（`QQMusicServiceConfig.ini`）与运行中进程内存里的
   `authst`，再用 `--uin/--authst` 传入。
 
-## 输出命名
+## 输出命名与去重
 
-- 有数据库元数据时：`<歌手> - <歌名>.<ogg|flac|mp3|m4a>`
-- 无元数据时：源文件 stem
-- 同名输出已存在 → 默认 SKIP；`--overwrite` 覆盖；扩展名由解密后真实签名决定（不盲信源后缀）
+- 本地解密：有数据库元数据时 `<歌手> - <歌名>.<ogg|flac|mp3|m4a>`，无元数据时用源文件 stem；
+  扩展名由解密后的真实签名决定（不盲信源后缀）
+- 歌单/我喜欢下载：`<歌手> - <版本名>`，其中版本名取接口的 **`title`**（带版本标记），
+  而不是 `name`（裸名）。例：`周深、王者荣耀 - 我们在场 (和声伴奏).flac` 与
+  `周深、王者荣耀 - 我们在场.flac` 是两个不同版本，实测 355 首「我喜欢」用 `title` 命名零撞名、
+  用 `name` 命名会撞 11 组
+- 每个下载文件写入指纹标签 **`qqmusic_songmid=<歌曲 mid>`**（ffmpeg 写进容器标签：
+  flac/mp3 为自定义帧、m4a 需 `use_metadata_tags`、opus 落在 stream 标签、wav 容器不支持）
+- 重跑时**先读指纹再决定要不要下载**：命中同一首直接 SKIP，一个字节都不下
+- 同名但指纹不同的另一版本 → 自动加序号另存（`xxx (2).flac`），绝不互相覆盖
+- 老文件（本版本之前下载、没有指纹标签）：文件名在歌单内唯一 → 沿用旧行为直接 SKIP；
+  文件名有歧义 → 下载后比对解码 PCM 的 MD5 确证，同一首则补写指纹（下次即可零流量跳过），
+  不同则另存序号
+- `--overwrite` 覆盖已存在输出
 
 ## Windows 兼容性（已实现，2026-08-18 实测）
 

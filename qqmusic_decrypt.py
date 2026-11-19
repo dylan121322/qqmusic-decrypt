@@ -41,7 +41,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import sqlite3
@@ -729,6 +729,221 @@ def ffprobe_duration(path: str) -> Optional[float]:
 
 
 # ----------------------------------------------------------------------------
+# 同名不同版本的区分（歌曲指纹标签 + PCM 比对）
+# ----------------------------------------------------------------------------
+
+SONG_MID_TAG = "qqmusic_songmid"   # 写进音频标签的歌曲指纹
+# flac/mp3 直接支持自定义键；m4a 需 -movflags use_metadata_tags；opus 落在 stream 标签；
+# wav 会静默丢弃 → 这类容器没有指纹，重跑时退回比对解码后的 PCM
+
+
+def _to_float(value: object) -> Optional[float]:
+    """把 API 里的数字/字符串/None 统一转成 float，失败返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def media_tags_and_duration(path: str) -> Tuple[Optional[float], Dict[str, str]]:
+    """一次 ffprobe 取回 (时长, 标签字典)。opus/ogg 的标签挂在 stream 上，一并合并。"""
+    ffprobe = tool_path("ffprobe")
+    if not ffprobe:
+        return None, {}
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "format=duration:format_tags:stream_tags",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None, {}
+        data = json.loads(r.stdout or "{}")
+    except Exception:  # noqa: BLE001
+        return None, {}
+
+    tags: Dict[str, str] = {}
+    fmt = data.get("format") or {}
+    for key, val in (fmt.get("tags") or {}).items():
+        tags[str(key).lower()] = str(val)
+    for stream in data.get("streams") or []:
+        for key, val in (stream.get("tags") or {}).items():
+            tags.setdefault(str(key).lower(), str(val))
+    return _to_float(fmt.get("duration")), tags
+
+
+def file_equals_bytes(path: str, data: bytes, chunk: int = 1 << 20) -> Optional[bool]:
+    """逐块比较文件内容与内存字节是否完全一致；读不了返回 None。"""
+    try:
+        if os.path.getsize(path) != len(data):
+            return False
+        with open(path, "rb") as fh:
+            off = 0
+            while off < len(data):
+                block = fh.read(chunk)
+                if not block or block != data[off:off + len(block)]:
+                    return False
+                off += len(block)
+            return fh.read(1) == b""
+    except OSError:
+        return None
+
+
+def audio_content_md5(source: Any) -> Optional[str]:
+    """解码成 PCM 后的 MD5 —— 忽略容器/标签差异，只比音频内容。
+
+    source 可以是文件路径或字节串（老文件被 ffmpeg 重写过标签，字节必然不同，
+    只有解码后的 PCM 才能判断是不是同一首）。
+    """
+    ffmpeg = tool_path("ffmpeg")
+    if not ffmpeg:
+        return None
+    import tempfile
+    tmp_name: Optional[str] = None
+    target: str
+    if isinstance(source, (bytes, bytearray)):
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            fh.write(bytes(source))
+            tmp_name = fh.name
+        target = tmp_name
+    else:
+        target = str(source)
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", target, "-map", "0:a:0", "-f", "md5", "-"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if r.returncode == 0:
+            m = re.search(r"MD5=([0-9a-f]{32})", r.stdout or "")
+            if m:
+                return m.group(1)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        if tmp_name:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+    return None
+
+
+def existing_is_same_song(path: str, song_mid: str,
+                          expected_bytes: Optional[bytes] = None) -> Optional[bool]:
+    """判断已存在文件是不是同一首。
+
+    返回 True=同一首（可跳过）、False=同名但另一版本（换名字存）、None=无从判断。
+    判定顺序：
+      1. 指纹标签 `qqmusic_songmid`（本版本起写入；精确、零成本）
+      2. 没有指纹的老文件：字节相同 → 同一首；否则比对解码后的 PCM MD5
+        （老文件被 ffmpeg 加过 title/artist，字节必然不同，只能比 PCM）
+    为什么不能只靠文件名：「我们在场」与「我们在场 (和声伴奏)」的 name 完全一样，
+    时长也完全一样（都是 200s），只有 title 和音频内容不同。
+    """
+    _, tags = media_tags_and_duration(path)
+    tag_mid = tags.get(SONG_MID_TAG)
+    if song_mid and tag_mid:
+        return tag_mid == song_mid
+    if tag_mid:
+        return None  # 有指纹但不是同一套（不该发生）→ 保守
+    if expected_bytes is None:
+        return None  # 无从判断
+    same = file_equals_bytes(path, expected_bytes)
+    if same:
+        return True
+    old_md5 = audio_content_md5(path)
+    new_md5 = audio_content_md5(expected_bytes)
+    if old_md5 and new_md5:
+        return old_md5 == new_md5
+    return None
+
+
+def resolve_download_path(folder: Path, fname: str, ext: str, song: dict,
+                          overwrite: bool,
+                          expected_bytes: Optional[bytes] = None) -> Tuple[Path, str]:
+    """决定落盘路径：同名不同版本自动加序号，绝不互相覆盖。
+
+    返回 (路径, 状态)，状态取值：
+      new               — 该路径可用，直接写
+      exists            — 同一首歌已证实存在，跳过（可安全补写指纹）
+      exists-unverified — 像是同一首但没法证实，保守跳过（不补写指纹）
+      overwrite         — 同一首歌已存在，按要求覆盖
+    """
+    mid = str(song.get("mid") or "")
+    candidates = [folder / f"{fname}.{ext}"]
+    candidates += [folder / f"{fname} ({n}).{ext}" for n in range(2, 51)]
+    for cand in candidates:
+        if not cand.exists():
+            return cand, "new"
+        verdict = existing_is_same_song(str(cand), mid, expected_bytes)
+        if verdict is False:
+            continue  # 这个名字已被"另一版本"占用 → 试下一个序号
+        if overwrite:
+            return cand, "overwrite"
+        # 同一首（标签或字节已证实）/ 判断不了 → 都跳过，但只有证实过的才敢补写指纹
+        return cand, ("exists" if verdict is True else "exists-unverified")
+    # 50 个候选全被不同版本占满 → 用 mid 兜底，绝不覆盖
+    suffix = f" [{mid}]" if mid else " (dup)"
+    return folder / f"{fname}{suffix}.{ext}", "new"
+
+
+def find_existing_download(folder: Path, fname: str, song: dict,
+                           name_ambiguous: bool,
+                           probe_tags: bool = True) -> Optional[Path]:
+    """下载前判定：已有同一首就返回该文件（省掉整首下载），否则返回 None。
+
+    判定只用指纹标签 `qqmusic_songmid`（无需下载）。老文件没有标签时：
+      - 该文件名在歌单里唯一 → 沿用旧行为，直接当同一首（不重复下载）
+      - 该文件名在歌单里重名（无法判断是谁）→ 不信任，交给下载后的 PCM 比对
+    """
+    mid = str(song.get("mid") or "")
+    pattern = glob.escape(fname)
+    try:
+        # 同名的干净名 + 序号码（xxx (2).flac）+ mid 兜底名（xxx [mid].flac）都算候选
+        hits: List[Path] = []
+        for pat in (f"{pattern}.*", f"{pattern} ([0-9]*).*", f"{pattern} [*].*"):
+            hits.extend(folder.glob(pat))
+    except OSError:
+        return None
+    for cand in sorted(set(hits)):
+        if cand.suffix.lower() not in PLAIN_AUDIO_EXTS:
+            continue
+        if not probe_tags:
+            return None if name_ambiguous else cand
+        verdict = existing_is_same_song(str(cand), mid, None)
+        if verdict is True:
+            return cand
+        if verdict is None and not name_ambiguous:
+            return cand  # 无指纹的老文件 + 文件名唯一 → 按旧行为跳过
+    return None
+
+
+def legacy_fname(song: dict) -> str:
+    """老版本（v1.0.9 及以前）按 name 生成的文件名，用于识别"这一批名字有歧义"。"""
+    artists = "、".join(x.get("name", "") for x in song.get("singer") or [])
+    name = str(song.get("name") or "")
+    return sanitize_name(f"{artists} - {name}") if artists else sanitize_name(name)
+
+
+def upgrade_legacy_fingerprint(path: Path, title: str, artists: str, album: str,
+                               song_mid: str) -> bool:
+    """给"内容比对已证实同曲"的老文件补写指纹标签，之后可在下载前直接跳过。"""
+    if not song_mid:
+        return False
+    _, tags = media_tags_and_duration(str(path))
+    if tags.get(SONG_MID_TAG):
+        return False
+    if apply_tags(str(path), title or path.stem, artists, album, song_mid):
+        print(f"        已补写歌曲指纹 {song_mid} → {path.name}")
+        return True
+    return False
+
+
+# ----------------------------------------------------------------------------
 # 凭据（macOS plist / NSKeyedArchiver）
 # ----------------------------------------------------------------------------
 
@@ -1283,7 +1498,8 @@ def get_playlist_detail(creds: Credentials, tid: int, max_songs: int = 0,
 def song_display(song: dict) -> str:
     artists = "、".join(s.get("name", "") for s in song.get("singer") or [])
     album = (song.get("album") or {}).get("name", "")
-    return f"{artists} - {song.get('name')} [{album}] ({song.get('mid')})"
+    display = str(song.get("title") or "").strip() or song.get("name")
+    return f"{artists} - {display} [{album}] ({song.get('mid')})"
 
 
 def strip_musicex_footer(data: bytes) -> bytes:
@@ -1347,7 +1563,8 @@ def download_song_bytes(ctx: BatchContext, song: dict, qualities: Sequence[str])
     raise QmcError("所有音质均失败 -> " + joined + hint)
 
 
-def apply_tags(path: str, title: str, artist: str, album: str) -> bool:
+def apply_tags(path: str, title: str, artist: str, album: str,
+               song_mid: Optional[str] = None) -> bool:
     ffmpeg = tool_path("ffmpeg")
     if not ffmpeg:
         return False
@@ -1357,6 +1574,12 @@ def apply_tags(path: str, title: str, artist: str, album: str) -> bool:
            "-metadata", f"artist={artist}"]
     if album:
         cmd += ["-metadata", f"album={album}"]
+    if song_mid:
+        # 指纹标签：下次重跑据此区分"同一首"与"同名不同版本"
+        cmd += ["-metadata", f"{SONG_MID_TAG}={song_mid}"]
+        if Path(path).suffix.lower() in (".m4a", ".mp4"):
+            # mp4/m4a 默认丢弃自定义键，必须显式开启
+            cmd += ["-movflags", "use_metadata_tags"]
     cmd += [tmp]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=60)
@@ -1935,6 +2158,60 @@ def run_self_test() -> None:
     assert info.kind == "cache"
     print("  Win duty 缓存文件名解析: OK")
 
+    # 9. 同名不同版本：指纹标签 + 字节比对（真实「我们在场 vs 和声伴奏」的形态）
+    ffmpeg_bin, ffprobe_bin = tool_path("ffmpeg"), tool_path("ffprobe")
+    if not (ffmpeg_bin and ffprobe_bin):
+        print("  同名不同版本判定: SKIP（缺 ffmpeg/ffprobe）")
+    else:
+        import tempfile
+        stem = "周深、王者荣耀 - 我们在场"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "seed.flac"
+            subprocess.run([ffmpeg_bin, "-v", "error", "-y", "-f", "lavfi",
+                            "-i", "sine=frequency=440:duration=4", str(src)],
+                           check=True, capture_output=True)
+            audio_a = src.read_bytes()
+
+            tagged = root / f"{stem}.flac"           # 带指纹标签（本版本写出的文件）
+            shutil.copyfile(src, tagged)
+            assert apply_tags(str(tagged), "我们在场 (和声伴奏)", "周深、王者荣耀", "", "MID_A")
+            song_a = {"mid": "MID_A"}
+            song_b = {"mid": "MID_B"}
+            # a) 指纹一致 → 同一首
+            assert existing_is_same_song(str(tagged), "MID_A", audio_a) is True
+            assert resolve_download_path(root, stem, "flac", song_a, False, audio_a)[1] == "exists"
+            # b) 指纹不同 → 另存序号（带标签的文件不参与字节比对）
+            assert existing_is_same_song(str(tagged), "MID_B", audio_a) is False
+            path_b, state_b = resolve_download_path(root, stem, "flac", song_b, False, audio_a)
+            assert state_b == "new" and path_b.name == f"{stem} (2).flac", (path_b, state_b)
+
+            legacy = root / "legacy"
+            legacy.mkdir()
+            shutil.copyfile(src, legacy / f"{stem}.flac")   # 老文件：无指纹标签
+            # c) 无标签 + 字节完全一致 → 同一首
+            assert resolve_download_path(legacy, stem, "flac", song_a, False, audio_a)[1] == "exists"
+            # d) 无标签 + 音频内容不同（同样的时长，但 PCM 不同）→ 另一版本，换序号存
+            other = root / "other.flac"
+            subprocess.run([ffmpeg_bin, "-v", "error", "-y", "-f", "lavfi",
+                            "-i", "sine=frequency=880:duration=4", str(other)],
+                           check=True, capture_output=True)
+            audio_b = other.read_bytes()
+            assert audio_b != audio_a
+            path_d, state_d = resolve_download_path(legacy, stem, "flac", song_b, False, audio_b)
+            assert state_d == "new" and path_d.name == f"{stem} (2).flac", (path_d, state_d)
+            # d2) 老文件被 ffmpeg 重写过标签（字节不同、PCM 相同）→ 仍判为同一首
+            remixed = legacy / "remixed.flac"
+            subprocess.run([ffmpeg_bin, "-v", "error", "-y",
+                            "-i", str(legacy / f"{stem}.flac"), "-c", "copy",
+                            "-metadata", "title=我们在场", str(remixed)],
+                           check=True, capture_output=True)
+            assert remixed.read_bytes() != audio_a
+            assert existing_is_same_song(str(remixed), "MID_B", audio_a) is True
+            # e) 覆盖模式：同一首 → overwrite
+            assert resolve_download_path(legacy, stem, "flac", song_a, True, audio_a)[1] == "overwrite"
+        print("  同名不同版本判定（指纹标签 + PCM 比对）: OK")
+
     print("== 全部自测通过 ==")
 
 
@@ -2054,40 +2331,69 @@ def download_playlist_songs(ctx: BatchContext, tid: int, default_name: str,
             f"请改用 --out-dir 指向本机可写目录"
         ) from e
     ok = fail = skip = 0
+    # 老版本按 name 命名，同名不同版本会撞成同一个文件名 → 先统计哪些裸名有歧义
+    legacy_counts: Dict[str, int] = {}
+    for song in songs:
+        key = legacy_fname(song)
+        legacy_counts[key] = legacy_counts.get(key, 0) + 1
     for i, song in enumerate(songs, 1):
         name = str(song.get("name") or "未知歌曲")
+        # title 才带版本标记（Live / 伴奏 / 和声伴奏 / Remaster…），name 是去掉标记的裸名：
+        # 「我们在场」与「我们在场 (和声伴奏)」的 name 完全相同，只用 name 会互相覆盖/误跳过
+        display = str(song.get("title") or "").strip() or name
         artists = "、".join(s.get("name", "") for s in song.get("singer") or [])
         album = str((song.get("album") or {}).get("name", ""))
+        mid = str(song.get("mid") or "")
+        fname = sanitize_name(f"{artists} - {display}") if artists else sanitize_name(display)
+        ambiguous = legacy_counts.get(legacy_fname(song), 0) > 1
         try:
+            # ① 下载前先查指纹标签：同一首直接跳过，一个字节都不下
+            if not opts.overwrite:
+                hit = find_existing_download(folder, fname, song, ambiguous,
+                                             probe_tags=not opts.no_ffprobe)
+                if hit is not None:
+                    print(f"[{i}/{len(songs)}] SKIP {hit.name}  (同一首已存在)")
+                    skip += 1
+                    results.append(Result(f"{artists} - {display}", "skip",
+                                          f"输出已存在: {hit}"))
+                    continue
             audio, ext, quality = download_song_bytes(ctx, song, qualities)
-            fname = sanitize_name(f"{artists} - {name}") if artists else sanitize_name(name)
             want_ext = str(getattr(opts, "out_format", "auto") or "auto")
             final_ext = ext if want_ext == "auto" else want_ext
-            out_path = folder / f"{fname}.{final_ext}"
-            if out_path.exists() and not opts.overwrite:
-                print(f"[{i}/{len(songs)}] SKIP {fname}.{final_ext}  (已存在)")
+            # ② 下载后再精确判定一次（老文件字节比对 + 同名不同版本自动加序号）
+            out_path, state = resolve_download_path(
+                folder, fname, final_ext, song, opts.overwrite,
+                audio if final_ext == ext else None)
+            if state in ("exists", "exists-unverified"):
+                if state == "exists":
+                    # 字节比对已证实是老文件 → 补指纹，下次可在下载前跳过
+                    upgrade_legacy_fingerprint(out_path, display, artists, album, mid)
+                print(f"[{i}/{len(songs)}] SKIP {out_path.name}  (同一首已存在)")
                 skip += 1
-                results.append(Result(f"{artists} - {name}", "skip",
+                results.append(Result(f"{artists} - {display}", "skip",
                                       f"输出已存在: {out_path}"))
                 continue
+            if out_path.name != f"{fname}.{final_ext}":
+                print(f"[{i}/{len(songs)}] 同名不同版本 → 另存为 {out_path.name}")
             out_path, note = save_audio_with_conversion(
-                audio, folder, fname, ext, want_ext, opts.overwrite)
+                audio, folder, out_path.stem, ext, want_ext, opts.overwrite)
             if opts.tag:
-                apply_tags(str(out_path), name, artists, album)
+                apply_tags(str(out_path), display, artists, album,
+                           str(song.get("mid") or "") or None)
             dur = ffprobe_duration(str(out_path)) if not opts.no_ffprobe else None
             msg = f"{Path(out_path).suffix[1:].upper()} {quality} {os.path.getsize(out_path)}B{note}"
             if dur is not None:
                 msg += f" {dur:.1f}s"
             print(f"[{i}/{len(songs)}] OK  {out_path}  ({msg})")
             ok += 1
-            results.append(Result(f"{artists} - {name}", "ok", msg,
+            results.append(Result(f"{artists} - {display}", "ok", msg,
                                   str(out_path), dur))
         except Exception as e:  # noqa: BLE001
-            print(f"[{i}/{len(songs)}] FAIL {artists} - {name}  {e}", file=sys.stderr)
-            log_error(f"[{i}/{len(songs)}] FAIL {artists} - {name} ({song.get('mid')})  {e}",
+            print(f"[{i}/{len(songs)}] FAIL {artists} - {display}  {e}", file=sys.stderr)
+            log_error(f"[{i}/{len(songs)}] FAIL {artists} - {display} ({song.get('mid')})  {e}",
                       exc_info=not isinstance(e, (QmcError, ApiError)))
             fail += 1
-            results.append(Result(f"{artists} - {name}", "fail", str(e)))
+            results.append(Result(f"{artists} - {display}", "fail", str(e)))
         if ctx.stop:
             print(f"!! 凭据失效，停止本歌单剩余 {len(songs) - i} 首: {ctx.stop_reason}",
                   file=sys.stderr)
@@ -2427,7 +2733,7 @@ class InteractiveCli:
 提示：
   - 格式转换全部使用内置 ffmpeg（无需系统安装）；
   - 歌单下载默认输出到 <输出目录>/<歌单名>/；
-  - 重复运行自动 SKIP 已存在文件；
+  - 重复运行靠歌曲指纹(qqmusic_songmid 标签)在下载前判定，同一首直接 SKIP 不耗流量；同名不同版本另存序号；
   - authst 过期会提示重新登录 QQ 音乐；
   - 技术原理见 TECHNICAL.md。
 仅限本人账号资源、个人备份用途。""")

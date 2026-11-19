@@ -357,9 +357,37 @@ songlist 条目关键字段：`mid`（songmid，即资源 ID）、`name`、
 普通音质（m4a/mp3-128/mp3-320）:
   CgiGetVkey → GET purl → sniff → 直接落盘
   ↓
-写盘命名: <out-dir>/<歌单名>/<歌手>、<歌手> - <歌名>.<sniffed ext>
-ffmpeg: -c copy -metadata title/artist/album 写入标签（可选）
+写盘命名: <out-dir>/<歌单名>/<歌手>、<歌手> - <版本名>.<sniffed ext>
+ffmpeg: -c copy -metadata title/artist/album + qqmusic_songmid 写入标签（可选）
 ```
+
+#### 5.3.1 同名不同版本：为什么必须用 `title` + 歌曲指纹（2026-09-25 实测）
+
+用户「我喜欢」歌单里有两首「我们在场」（周深 / 王者荣耀），接口返回：
+
+| # | mid | name | title | interval | size_flac |
+|---|-----|------|-------|----------|-----------|
+| 30 | `003bwruf2zFnCe` | `我们在场` | `我们在场 (和声伴奏)` | 200 | 43,577,131 |
+| 31 | `003dne8X3EFtEI` | `我们在场` | `我们在场` | 200 | 44,711,890 |
+
+**`name` 字段是裸名，版本标记只在 `title` 里**；两首时长还完全相同（都 200s）。
+旧版按 `name` 命名 + 只判"文件是否存在"，于是 [31] 直接 SKIP，整首歌丢失。
+统计整个歌单：按 `name` 命名撞名 **11 组**（我们在场 / 问 / 绘本 / 晓 / 覆灭重生 / 红透晚烟青 /
+空白 / 无涯 / なんでもないや / スパークル / 一决高下），按 `title` 命名 **0 组**。
+
+现在的判定链（`existing_is_same_song()`）：
+
+1. **指纹标签** `qqmusic_songmid`（本版本起写入）→ 完全相同才算同一首，零成本、精确；
+2. 没有指纹的老文件 → 先逐块比字节（相同即同一首），否则 **解码 PCM 的 MD5**
+   （`ffmpeg -map 0:a:0 -f md5 -`：老文件被 ffmpeg 重写过 title/artist 标签，
+   字节必然不同，只有 PCM 能证明是不是同一首）；
+3. 确证为同一首的老文件 → 就地补写指纹，下次即可在**下载前**跳过；
+4. 确证为另一版本 → 自动加序号另存 `xxx (2).flac`，绝不覆盖。
+
+跳过判定已前移到下载之前（`find_existing_download()`）：命中指纹就直接 SKIP，
+不再像旧版那样"先下完整首再判断"（355 首 ≈ 14GB 白流量）。
+容器差异：flac/mp3 支持自定义键；m4a 需要 `-movflags use_metadata_tags`；
+opus 的标签落在 stream 上（读取时 format/stream 合并）；wav 容器丢弃自定义键 → 只能靠 PCM 比对。
 
 ## 6. 工具架构
 
@@ -448,6 +476,8 @@ ffmpeg: -c copy -metadata title/artist/album 写入标签（可选）
 | 11 | 重跑本地解密浪费 API | 先解密才知道输出名 | 后缀→扩展名预判，已存在直接 SKIP（API=0） |
 | 12 | xlog 解码失败 | QQ 音乐使用私有 ECDH 密钥加密日志（非 Mars 默认密钥） | 放弃该路线，改二进制 strings + 实测；临时 dec.log 已清理 |
 | 13 | 第三方文档两处错误 | musicex 尾部偏移表；`#!Qk` 魔数说法 | 以本机 hexdump 与实现代码为准，文档已注明 |
+| 14 | 同名不同版本被判成同一首而 SKIP（丢歌） | 歌单接口 `name` 是裸名（版本标记在 `title`），旧版按 `name` 命名且只判"文件存在" | 改用 `title` 命名（355 首撞名 11 组 → 0 组）+ 写入 `qqmusic_songmid` 指纹标签，判定见 §5.3.1 |
+| 15 | 跳过判定发生在整首下载之后 | `download_song_bytes()` 在 skip 判断之前调用 | 前移为 `find_existing_download()`：读指纹即跳过，355 首重跑 0 字节下载（实测） |
 
 ---
 
